@@ -46,6 +46,7 @@ import {
   upsertProfile,
 } from "../lib/api";
 import { getPrivyWalletConnection, pickPrimaryPrivyWallet } from "../lib/web3/privy";
+import { formatUnsupportedRecoveryMethodMessage, getEmbeddedWalletRecoveryState } from "../lib/web3/privyRecovery";
 import type {
   CdrState,
   CareerHistoryItem,
@@ -158,8 +159,15 @@ const paidFieldDefs: Array<Pick<FieldDraft, "kind" | "label" | "valuePreview" | 
 
 const socialHandleFieldKinds = new Set<DataFieldKind>(["telegram", "discord", "twitter"]);
 const fieldLevelByKind = new Map<DataFieldKind, "LV1" | "LV2">(paidFieldDefs.map((field) => [field.kind, field.level]));
+const fieldLabelByKind = new Map<DataFieldKind, string>(paidFieldDefs.map((field) => [field.kind, field.label]));
 
-const freeDataTip = "무료 데이터에 정확히 적어줘야 데이터가 세일즈 될 확률이 높아요.";
+function formatFieldList(kinds: DataFieldKind[] | undefined, maxVisible = 4) {
+  const labels = (kinds ?? []).map((kind) => fieldLabelByKind.get(kind) ?? kind);
+  if (labels.length <= maxVisible) return labels.join(", ");
+  return `${labels.slice(0, maxVisible).join(", ")} +${labels.length - maxVisible}`;
+}
+
+const freeDataTip = "Precise free data improves your chance of selling data.";
 const genderOptions = [
   { value: "male", label: "Male" },
   { value: "female", label: "Female" },
@@ -550,7 +558,7 @@ export function AxiosApp() {
   const [activeMyDataFilter, setActiveMyDataFilter] = useState<MyDataFilterKey>("basic");
   const [profile, setProfile] = useState<ProfileDraft>(defaultProfile);
   const [fields, setFields] = useState<FieldDraft[]>(createInitialFields);
-  const [prompt, setPrompt] = useState("29-32세에 서울에 거주하는 IT 직장인");
+  const [prompt, setPrompt] = useState("IT professionals");
   const [selectedFields, setSelectedFields] = useState<DataFieldKind[]>(["email", "mobile", "telegram"]);
   const [quote, setQuote] = useState<QuoteResponse | null>(null);
   const [selectedMatches, setSelectedMatches] = useState<string[]>([]);
@@ -576,8 +584,13 @@ export function AxiosApp() {
   const profileMenuRef = useRef<HTMLDivElement>(null);
   const profileLoadedForRef = useRef("");
 
-  const activeWallet = useMemo(() => pickPrimaryPrivyWallet(wallets), [wallets]);
-  const connectedWallet: string | undefined = walletsReady ? activeWallet?.address ?? user?.wallet?.address : undefined;
+  const embeddedWalletRecoveryState = useMemo(() => getEmbeddedWalletRecoveryState(user), [user]);
+  const activeWallet = useMemo(
+    () => (embeddedWalletRecoveryState.supported ? pickPrimaryPrivyWallet(wallets) : null),
+    [embeddedWalletRecoveryState.supported, wallets],
+  );
+  const connectedWallet: string | undefined =
+    walletsReady && embeddedWalletRecoveryState.supported ? activeWallet?.address ?? user?.wallet?.address : undefined;
   const loginEmail = user?.email?.address?.trim() ?? "";
   const privyAccountEmail =
     [
@@ -952,6 +965,10 @@ export function AxiosApp() {
   }
 
   function requireWallet(action: string) {
+    if (authenticated && !embeddedWalletRecoveryState.supported) {
+      setNotice(formatUnsupportedRecoveryMethodMessage(embeddedWalletRecoveryState.method));
+      return undefined;
+    }
     if (!connectedWallet) {
       if (!authenticated) {
         login();
@@ -973,11 +990,19 @@ export function AxiosApp() {
       login();
       return;
     }
+    if (!embeddedWalletRecoveryState.supported) {
+      setNotice(formatUnsupportedRecoveryMethodMessage(embeddedWalletRecoveryState.method));
+      return;
+    }
     setNotice(connectedWallet ? "Embedded wallet ready" : "Embedded wallet is still being prepared");
   }
 
   function requireEmbeddedWallet(action: string) {
     if (!requireAppSession(action)) return undefined;
+    if (!embeddedWalletRecoveryState.supported) {
+      setNotice(formatUnsupportedRecoveryMethodMessage(embeddedWalletRecoveryState.method));
+      return undefined;
+    }
     if (!connectedWallet || !activeWallet) {
       setNotice("Embedded wallet unavailable. Reconnect Privy before wallet actions.");
       return undefined;
@@ -986,6 +1011,9 @@ export function AxiosApp() {
   }
 
   async function getEmbeddedWalletConnection() {
+    if (!embeddedWalletRecoveryState.supported) {
+      throw new Error(formatUnsupportedRecoveryMethodMessage(embeddedWalletRecoveryState.method));
+    }
     if (!activeWallet) throw new Error("wallet_not_ready");
     try {
       return await getPrivyWalletConnection(activeWallet);
@@ -995,6 +1023,30 @@ export function AxiosApp() {
       }
       throw error;
     }
+  }
+
+  async function mintLicenseBatchForFields(fieldCosts: QuoteFieldCost[], buyerWallet: string) {
+    const mintInputs = fieldCosts.map((field) => {
+      if (
+        !isAddress(field.cdrLicenseIpId) ||
+        !isUintString(field.cdrLicenseTermsId) ||
+        !isAddress(field.ipaNftContract) ||
+        !isUintString(field.ipaTokenId) ||
+        !isTxHash(field.licenseConfigTxHash)
+      ) {
+        throw new Error("field_license_config_missing");
+      }
+      return {
+        fieldId: field.fieldId,
+        licensorIpId: field.cdrLicenseIpId,
+        licenseTermsId: field.cdrLicenseTermsId,
+        receiver: buyerWallet as `0x${string}`,
+      };
+    });
+    setNotice(`Minting ${mintInputs.length} licenses`);
+    const walletConnection = await getEmbeddedWalletConnection();
+    const { mintStoryLicenseTokensBatch } = await import("../lib/web3/license");
+    return mintStoryLicenseTokensBatch(walletConnection, mintInputs);
   }
 
   async function handleCopyWallet(value: string, label: string) {
@@ -1313,29 +1365,7 @@ export function AxiosApp() {
     }
     setBusy("order");
     try {
-      const walletConnection = await getEmbeddedWalletConnection();
-      const { mintStoryLicenseToken } = await import("../lib/web3/license");
-      const licenseTokenGrants = [];
-      for (const field of selectedLicenseFields) {
-        if (
-          !isAddress(field.cdrLicenseIpId) ||
-          !isUintString(field.cdrLicenseTermsId) ||
-          !isAddress(field.ipaNftContract) ||
-          !isUintString(field.ipaTokenId) ||
-          !isTxHash(field.licenseConfigTxHash)
-        ) {
-          throw new Error("field_license_config_missing");
-        }
-        setNotice(`Minting ${field.label} license`);
-        licenseTokenGrants.push(
-          await mintStoryLicenseToken(walletConnection, {
-            fieldId: field.fieldId,
-            licensorIpId: field.cdrLicenseIpId,
-            licenseTermsId: field.cdrLicenseTermsId,
-            receiver: buyerWallet as `0x${string}`,
-          }),
-        );
-      }
+      const licenseTokenGrants = await mintLicenseBatchForFields(selectedLicenseFields, buyerWallet);
       const response = await createOrder({
         quoteId: quote.quoteId,
         buyerWallet,
@@ -1453,29 +1483,7 @@ export function AxiosApp() {
     }
     setBusy(`request-checkout-${searchRequestDetail.id}`);
     try {
-      const walletConnection = await getEmbeddedWalletConnection();
-      const { mintStoryLicenseToken } = await import("../lib/web3/license");
-      const licenseTokenGrants = [];
-      for (const field of selectedFieldCosts) {
-        if (
-          !isAddress(field.cdrLicenseIpId) ||
-          !isUintString(field.cdrLicenseTermsId) ||
-          !isAddress(field.ipaNftContract) ||
-          !isUintString(field.ipaTokenId) ||
-          !isTxHash(field.licenseConfigTxHash)
-        ) {
-          throw new Error("field_license_config_missing");
-        }
-        setNotice(`Minting ${field.label} license`);
-        licenseTokenGrants.push(
-          await mintStoryLicenseToken(walletConnection, {
-            fieldId: field.fieldId,
-            licensorIpId: field.cdrLicenseIpId,
-            licenseTermsId: field.cdrLicenseTermsId,
-            receiver: buyerWallet as `0x${string}`,
-          }),
-        );
-      }
+      const licenseTokenGrants = await mintLicenseBatchForFields(selectedFieldCosts, buyerWallet);
       const wantedFields = searchRequestDetail.wantedFields?.length ? searchRequestDetail.wantedFields : searchRequestDetail.recommendedFields;
       const response = await createOrder({
         quoteId: searchRequestDetail.id,
@@ -1732,7 +1740,7 @@ export function AxiosApp() {
             <strong>Sign-in failed</strong>
             <span>{authError}</span>
             <button type="button" onClick={() => setAuthAttempt((attempt) => attempt + 1)}>
-              재시도
+              Retry
             </button>
           </div>
         ) : null}
@@ -1795,13 +1803,19 @@ export function AxiosApp() {
     const workflowOnly = showSearchWorkflow && !showSearchResults;
     const allMatchesSelected = quote ? selectedMatches.length === quote.matches.length : false;
     const searchBox = (
-      <div className="search-box">
+      <form
+        className="search-box"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (busy !== "search") void runSearch();
+        }}
+      >
         <Search size={20} />
-        <input value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="29-32세에 서울에 거주하는 IT 직장인" />
-        <button type="button" onClick={runSearch} disabled={busy === "search"}>
+        <input value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="IT professionals" />
+        <button type="submit" disabled={busy === "search"}>
           Search
         </button>
-      </div>
+      </form>
     );
 
     return (
@@ -2341,7 +2355,7 @@ export function AxiosApp() {
                 <strong>{searchRequestDetail.prompt}</strong>
                 <div className="request-detail-meta">
                   <span>{searchRequestDetail.matchedProfileCount} cards</span>
-                  <span>{detailFields.join(", ")}</span>
+                  <span>{formatFieldList(detailFields)}</span>
                   <span>{formatIpAmount(searchRequestDetail.totalCents)}</span>
                   <span>{searchRequestDetail.extensions?.length ?? 0} extensions</span>
                   <span>{searchRequestDetail.id}</span>
@@ -2497,7 +2511,7 @@ export function AxiosApp() {
                 <div>
                   <strong>{request.prompt}</strong>
                   <small>
-                    {request.matchedProfileCount} cards · {(request.wantedFields ?? request.recommendedFields).join(", ")} · {formatIpAmount(request.totalCents)}
+                    {request.matchedProfileCount} cards · {formatFieldList(request.wantedFields ?? request.recommendedFields)} · {formatIpAmount(request.totalCents)}
                   </small>
                   <small>{request.id}</small>
                 </div>
@@ -2526,7 +2540,7 @@ export function AxiosApp() {
               <article className="history-row" key={order.id}>
                 <div>
                   <strong>{order.prompt}</strong>
-                  <small>{order.sheetParams.fields.join(", ")} · {formatIpAmount(order.totalCents)}</small>
+                  <small>{formatFieldList(order.sheetParams.fields)} · {formatIpAmount(order.totalCents)}</small>
                   <small>{order.id}</small>
                 </div>
                 <div className="row-actions">

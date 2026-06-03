@@ -7,7 +7,7 @@ type LinkedPrivyAccount = {
   recoveryMethod?: string;
 };
 
-const SUPPORTED_RECOVERY_METHODS = new Set(["privy", "user-passcode", "google-drive", "icloud"]);
+const SUPPORTED_RECOVERY_METHODS = new Set(["user-passcode", "google-drive", "icloud"]);
 
 export type EmbeddedWalletRecoveryState = {
   method?: string;
@@ -42,6 +42,6 @@ export function getEmbeddedWalletRecoveryState(user: unknown): EmbeddedWalletRec
 
 export function formatUnsupportedRecoveryMethodMessage(method?: string) {
   return method
-    ? `Privy embedded wallet recovery method '${method}' is not supported by the current SDK. Upgrade Privy SDK or update wallet recovery before CDR actions.`
+    ? `Privy embedded wallet recovery method '${method}' is not supported by the current SDK. Update this account's embedded wallet recovery to passcode, Google Drive, or iCloud before wallet actions.`
     : "Privy embedded wallet recovery is not supported by the current SDK. Upgrade Privy SDK or update wallet recovery before CDR actions.";
 }
