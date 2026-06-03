@@ -100,6 +100,16 @@ function assertPrivateKey(value) {
   return value;
 }
 
+async function writeJsonAndExit(payload) {
+  await new Promise((resolve, reject) => {
+    process.stdout.write(JSON.stringify(payload), (error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+  process.exit(0);
+}
+
 function priceMinorUnitsToWei(priceMinorUnits) {
   return BigInt(priceMinorUnits) * 10_000_000_000_000_000n;
 }
@@ -245,28 +255,26 @@ async function main() {
   const transferReceipt = await publicClient.waitForTransactionReceipt({ hash: transferTxHash });
   if (transferReceipt.status !== "success") throw new Error("ipa_transfer_failed");
 
-  process.stdout.write(
-    JSON.stringify({
-      platformWallet: account.address,
-      recipient,
-      cdrVaultUuid: cdr.cdrVaultUuid,
-      deployTxHash: cdr.deployTxHash,
-      allocateTxHash: cdr.allocateTxHash,
-      cdrOwnerAddress: cdr.cdrOwnerAddress,
-      writeConditionAddress: cdr.writeConditionAddress,
-      readConditionAddress: cdr.readConditionAddress,
-      writeConditionData: cdr.writeConditionData,
-      readConditionData: cdr.readConditionData,
-      cdrLicenseIpId: registered.ipId,
-      cdrLicenseTermsId: parentLicenseTermsId.toString(),
-      ipaNftContract: spgNftContract,
-      ipaTokenId: tokenId.toString(),
-      ipRegistrationTxHash: registered.txHash,
-      licenseConfigTxHash: licenseConfig.txHash,
-      licenseAttachTxHash: licenseConfig.txHash,
-      ipaTransferTxHash: transferTxHash,
-    }),
-  );
+  await writeJsonAndExit({
+    platformWallet: account.address,
+    recipient,
+    cdrVaultUuid: cdr.cdrVaultUuid,
+    deployTxHash: cdr.deployTxHash,
+    allocateTxHash: cdr.allocateTxHash,
+    cdrOwnerAddress: cdr.cdrOwnerAddress,
+    writeConditionAddress: cdr.writeConditionAddress,
+    readConditionAddress: cdr.readConditionAddress,
+    writeConditionData: cdr.writeConditionData,
+    readConditionData: cdr.readConditionData,
+    cdrLicenseIpId: registered.ipId,
+    cdrLicenseTermsId: parentLicenseTermsId.toString(),
+    ipaNftContract: spgNftContract,
+    ipaTokenId: tokenId.toString(),
+    ipRegistrationTxHash: registered.txHash,
+    licenseConfigTxHash: licenseConfig.txHash,
+    licenseAttachTxHash: licenseConfig.txHash,
+    ipaTransferTxHash: transferTxHash,
+  });
 }
 
 main().catch((error) => {

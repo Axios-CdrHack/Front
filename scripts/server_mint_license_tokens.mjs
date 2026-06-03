@@ -187,6 +187,16 @@ function assertPrivateKey(value) {
   return value;
 }
 
+async function writeJsonAndExit(payload) {
+  await new Promise((resolve, reject) => {
+    process.stdout.write(JSON.stringify(payload), (error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+  process.exit(0);
+}
+
 function assertUintString(value, key) {
   const text = String(value ?? "");
   if (!/^\d+$/.test(text)) throw new Error(`${key}_invalid`);
@@ -455,16 +465,14 @@ async function main() {
   await verifyOwners(publicClient, buyerWallet, grants);
   logStatus("owner_verified", { tokenIds: grants.map((grant) => grant.licenseTokenId), buyerWallet });
 
-  process.stdout.write(
-    JSON.stringify({
-      serverWallet: account.address,
-      buyerWallet,
-      transferFromServer: input.transferFromServer !== false,
-      transferTxHashes,
-      grants,
-      fees: fees.map((fee) => ({ currencyToken: fee.currencyToken, tokenAmount: fee.tokenAmount.toString() })),
-    }),
-  );
+  await writeJsonAndExit({
+    serverWallet: account.address,
+    buyerWallet,
+    transferFromServer: input.transferFromServer !== false,
+    transferTxHashes,
+    grants,
+    fees: fees.map((fee) => ({ currencyToken: fee.currencyToken, tokenAmount: fee.tokenAmount.toString() })),
+  });
 }
 
 main().catch((error) => {
