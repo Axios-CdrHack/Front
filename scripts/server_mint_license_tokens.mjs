@@ -19,7 +19,6 @@ const STORY_AENEID_PILICENSE_TEMPLATE_ADDRESS = "0x2E896b0b2Fdb7457499B56AAaA4AE
 const STORY_AENEID_WIP_TOKEN_ADDRESS = "0x1514000000000000000000000000000000000000";
 const STORY_AENEID_ROYALTY_MODULE_ADDRESS = "0xD2f60c40fEbccf6311f8B47c4f2Ec6b040400086";
 const MAX_REVENUE_SHARE = 100_000_000;
-const SERVER_WALLET_TX_CONCURRENCY = 3;
 
 const STORY_AENEID_CHAIN = defineChain({
   id: STORY_AENEID_CHAIN_ID,
@@ -294,25 +293,6 @@ async function ensureFeePrepared({ account, chain, publicClient, walletClient, c
   if (approveReceipt.status !== "success") throw new Error("license_fee_approval_failed");
 }
 
-async function runWithNonceLimit(items, startNonce, limit, worker) {
-  const results = new Array(items.length);
-  let nextIndex = 0;
-  let nextNonce = startNonce;
-  const workerCount = Math.min(limit, items.length);
-  await Promise.all(
-    Array.from({ length: workerCount }, async () => {
-      while (nextIndex < items.length) {
-        const index = nextIndex;
-        nextIndex += 1;
-        const nonce = nextNonce;
-        nextNonce += 1;
-        results[index] = await worker(items[index], index, nonce);
-      }
-    }),
-  );
-  return results;
-}
-
 function mintedTokenIdsFromReceipt(receipt, receiver) {
   const tokenIds = [];
   for (const log of receipt.logs) {
@@ -407,58 +387,66 @@ async function main() {
     await ensureFeePrepared({ account, chain, publicClient, walletClient, currencyToken: fee.currencyToken, tokenAmount: fee.tokenAmount });
   }
 
-  const mintNonce = await publicClient.getTransactionCount({ address: account.address, blockTag: "pending" });
-  const grants = await runWithNonceLimit(mintFields, mintNonce, SERVER_WALLET_TX_CONCURRENCY, async (field, index, nonce) => {
-    const prediction = predictions[index];
-    const mintTxHash = await walletClient.writeContract({
-      account,
-      chain,
-      address: STORY_AENEID_LICENSING_MODULE_ADDRESS,
-      abi: licensingModuleAbi,
-      functionName: "mintLicenseTokens",
-      args: [
-        field.licensorIpId,
-        STORY_AENEID_PILICENSE_TEMPLATE_ADDRESS,
-        BigInt(field.licenseTermsId),
-        amount,
-        mintReceiver,
-        royaltyContext,
-        prediction?.tokenAmount ?? 0n,
-        MAX_REVENUE_SHARE,
-      ],
-      nonce,
-    });
-    logStatus("mint_submitted", { fieldId: field.fieldId, mintTxHash, nonce });
-    const receipt = await publicClient.waitForTransactionReceipt({ hash: mintTxHash });
+  const mintNonceBase = await publicClient.getTransactionCount({ address: account.address, blockTag: "pending" });
+  const mintTxHashes = await Promise.all(
+    mintFields.map((field, index) => {
+      const prediction = predictions[index];
+      return walletClient.writeContract({
+        account,
+        chain,
+        address: STORY_AENEID_LICENSING_MODULE_ADDRESS,
+        abi: licensingModuleAbi,
+        functionName: "mintLicenseTokens",
+        args: [
+          field.licensorIpId,
+          STORY_AENEID_PILICENSE_TEMPLATE_ADDRESS,
+          BigInt(field.licenseTermsId),
+          amount,
+          mintReceiver,
+          royaltyContext,
+          prediction?.tokenAmount ?? 0n,
+          MAX_REVENUE_SHARE,
+        ],
+        nonce: mintNonceBase + index,
+      });
+    }),
+  );
+  logStatus("mint_submitted", { mintTxHashes });
+
+  const mintReceipts = await Promise.all(mintTxHashes.map((hash) => publicClient.waitForTransactionReceipt({ hash })));
+  const grants = mintReceipts.map((receipt, index) => {
+    const field = mintFields[index];
     if (receipt.status !== "success") throw new Error(`license_token_mint_failed:${field.fieldId}`);
     const tokenIds = mintedTokenIdsFromReceipt(receipt, mintReceiver);
     if (tokenIds.length !== 1) throw new Error(`license_token_mint_event_missing:${field.fieldId}`);
     return {
       fieldId: field.fieldId,
       licenseTokenId: tokenIds[0],
-      mintTxHash,
+      mintTxHash: mintTxHashes[index],
     };
   });
-  const mintTxHashes = grants.map((grant) => grant.mintTxHash);
 
   const transferTxHashes = [];
   if (input.transferFromServer !== false) {
-    const transferNonce = await publicClient.getTransactionCount({ address: account.address, blockTag: "pending" });
-    const submitted = await runWithNonceLimit(grants, transferNonce, SERVER_WALLET_TX_CONCURRENCY, async (grant, _index, nonce) => {
-      const transferTxHash = await walletClient.writeContract({
-        account,
-        chain,
-        address: STORY_AENEID_LICENSE_TOKEN_ADDRESS,
-        abi: licenseTokenAbi,
-        functionName: "safeTransferFrom",
-        args: [account.address, buyerWallet, BigInt(grant.licenseTokenId)],
-        nonce,
-      });
-      const receipt = await publicClient.waitForTransactionReceipt({ hash: transferTxHash });
-      if (receipt.status !== "success") throw new Error(`license_token_transfer_failed:${grant.fieldId}`);
-      return transferTxHash;
+    const transferNonceBase = await publicClient.getTransactionCount({ address: account.address, blockTag: "pending" });
+    const submitted = await Promise.all(
+      grants.map((grant, index) =>
+        walletClient.writeContract({
+          account,
+          chain,
+          address: STORY_AENEID_LICENSE_TOKEN_ADDRESS,
+          abi: licenseTokenAbi,
+          functionName: "safeTransferFrom",
+          args: [account.address, buyerWallet, BigInt(grant.licenseTokenId)],
+          nonce: transferNonceBase + index,
+        }),
+      ),
+    );
+    const transferReceipts = await Promise.all(submitted.map((hash) => publicClient.waitForTransactionReceipt({ hash })));
+    transferReceipts.forEach((receipt, index) => {
+      if (receipt.status !== "success") throw new Error(`license_token_transfer_failed:${grants[index].fieldId}`);
+      transferTxHashes.push(submitted[index]);
     });
-    transferTxHashes.push(...submitted);
     logStatus("transfer_done", { transferTxHashes });
   }
 
