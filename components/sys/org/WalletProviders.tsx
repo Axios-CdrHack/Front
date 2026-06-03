@@ -85,6 +85,7 @@ export function WalletProviders({ children }: { children: ReactNode }) {
     <PrivyProvider
       appId={appId}
       config={{
+        loginMethods: ["wallet"],
         embeddedWallets: {
           ethereum: {
             createOnLogin: "off",

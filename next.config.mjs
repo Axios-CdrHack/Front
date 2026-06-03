@@ -4,6 +4,9 @@ const permissionlessRoot = path.resolve("./node_modules/permissionless");
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  experimental: {
+    webpackBuildWorker: false,
+  },
   webpack(config, { isServer, webpack }) {
     config.resolve.alias = {
       ...(config.resolve.alias ?? {}),
