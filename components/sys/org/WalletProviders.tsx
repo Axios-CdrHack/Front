@@ -86,8 +86,9 @@ export function WalletProviders({ children }: { children: ReactNode }) {
       appId={appId}
       config={{
         embeddedWallets: {
-          createOnLogin: "off",
-          requireUserPasswordOnCreate: false,
+          ethereum: {
+            createOnLogin: "off",
+          },
           showWalletUIs: false,
         },
         defaultChain: STORY_AENEID_CHAIN,

@@ -466,6 +466,10 @@ function parseApiError(error: unknown) {
 }
 
 function formatKnownError(message: string) {
+  const normalized = message.toLowerCase();
+  if (normalized.includes("replacement transaction underpriced") || normalized.includes("transaction underpriced") || normalized.includes("nonce too low")) {
+    return "Previous wallet transaction is still pending. Wait a moment, then retry checkout.";
+  }
   if (message === "field_license_config_missing" || message === "no_purchasable_fields") {
     return "This CDR is not ready for on-chain license minting. Search again after the field deploy is complete.";
   }
@@ -1026,6 +1030,17 @@ export function AxiosApp() {
   }
 
   async function mintLicenseBatchForFields(fieldCosts: QuoteFieldCost[], buyerWallet: string) {
+    const debugFields = fieldCosts.map((field) => ({
+      fieldId: field.fieldId,
+      kind: field.kind,
+      label: field.label,
+      priceCents: field.priceCents,
+      cdrLicenseIpId: field.cdrLicenseIpId,
+      cdrLicenseTermsId: field.cdrLicenseTermsId,
+      ipaTokenId: field.ipaTokenId,
+      licenseConfigTxHash: field.licenseConfigTxHash,
+    }));
+    console.debug("[axios-mint] checkout_prepare", { buyerWallet, fieldCount: fieldCosts.length, fields: debugFields });
     const mintInputs = fieldCosts.map((field) => {
       if (
         !isAddress(field.cdrLicenseIpId) ||
@@ -1044,9 +1059,17 @@ export function AxiosApp() {
       };
     });
     setNotice(`Minting ${mintInputs.length} licenses`);
-    const walletConnection = await getEmbeddedWalletConnection();
-    const { mintStoryLicenseTokensBatch } = await import("../lib/web3/license");
-    return mintStoryLicenseTokensBatch(walletConnection, mintInputs);
+    try {
+      const walletConnection = await getEmbeddedWalletConnection();
+      console.debug("[axios-mint] wallet_ready", { account: walletConnection.account, fieldCount: mintInputs.length });
+      const { mintStoryLicenseTokensBatch } = await import("../lib/web3/license");
+      const grants = await mintStoryLicenseTokensBatch(walletConnection, mintInputs);
+      console.debug("[axios-mint] checkout_mint_success", { grantCount: grants.length, grants });
+      return grants;
+    } catch (error) {
+      console.error("[axios-mint] checkout_mint_failed", { buyerWallet, fieldCount: fieldCosts.length, fields: debugFields, error });
+      throw error;
+    }
   }
 
   async function handleCopyWallet(value: string, label: string) {
