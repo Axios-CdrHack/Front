@@ -169,7 +169,7 @@ const CDR_DEBUG_EVENT_LIMIT = 120;
 
 const paidFieldDefs: Array<Pick<FieldDraft, "kind" | "label" | "valuePreview" | "priceCents" | "requiresVerification"> & { level: "LV1" | "LV2" }> = [
   { kind: "email", label: "E-mail", valuePreview: "", priceCents: 900, requiresVerification: false, level: "LV1" },
-  { kind: "mobile", label: "Mobile", valuePreview: "", priceCents: 1400, requiresVerification: true, level: "LV1" },
+  { kind: "mobile", label: "Mobile", valuePreview: "", priceCents: 1400, requiresVerification: false, level: "LV1" },
   { kind: "telegram", label: "Telegram", valuePreview: "", priceCents: 450, requiresVerification: false, level: "LV1" },
   { kind: "discord", label: "Discord", valuePreview: "", priceCents: 350, requiresVerification: false, level: "LV1" },
   { kind: "twitter", label: "Twitter", valuePreview: "", priceCents: 300, requiresVerification: false, level: "LV1" },
