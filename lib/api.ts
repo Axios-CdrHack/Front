@@ -64,6 +64,7 @@ export function extendSearchRequest(requestId: string, input: { prompt: string }
 export function createOrder(input: {
   quoteId?: string;
   buyerWallet: string;
+  paymentWallet?: string;
   prompt: string;
   wantedFields: DataFieldKind[];
   selectedMatchRefs?: string[];
@@ -80,6 +81,7 @@ export function createOrder(input: {
 export function getOrderPaymentIntent(input: {
   quoteId?: string;
   buyerWallet: string;
+  paymentWallet?: string;
   prompt: string;
   wantedFields: DataFieldKind[];
   selectedMatchRefs?: string[];

@@ -49,7 +49,8 @@ import {
   upsertProfile,
 } from "../lib/api";
 import { sendNativeIpPayment } from "../lib/web3/payment";
-import { getPrivyWalletConnection, pickPrimaryPrivyWallet } from "../lib/web3/privy";
+import { readLicenseTokenOwners } from "../lib/web3/licenseOwnership";
+import { getPrivyWalletConnection, isEmbeddedPrivyWallet, pickPrimaryPrivyWallet } from "../lib/web3/privy";
 import { formatUnsupportedRecoveryMethodMessage, getEmbeddedWalletRecoveryState } from "../lib/web3/privyRecovery";
 import type {
   CdrState,
@@ -145,6 +146,10 @@ type AccessPreviewState = {
   failedFieldIds: string[];
   generatedAt: string;
 };
+type RequestAccessStatusState = {
+  requestId: string;
+  pendingFieldIds: string[];
+};
 type HistorySection = "education" | "career";
 type HistoryDragState = {
   section: HistorySection;
@@ -158,6 +163,9 @@ const navItems: Array<{ key: NavKey; label: string; icon: IconAssetName }> = [
   { key: "sales", label: "Sales", icon: "ip" },
   { key: "settings", label: "Settings", icon: "setting" },
 ] as const;
+
+const REQUEST_ACCESS_POLL_DELAY_MS = 4_000;
+const CDR_DEBUG_EVENT_LIMIT = 120;
 
 const paidFieldDefs: Array<Pick<FieldDraft, "kind" | "label" | "valuePreview" | "priceCents" | "requiresVerification"> & { level: "LV1" | "LV2" }> = [
   { kind: "email", label: "E-mail", valuePreview: "", priceCents: 900, requiresVerification: false, level: "LV1" },
@@ -453,7 +461,7 @@ function parseApiError(error: unknown) {
   if (error instanceof Error) {
     const knownMessage = formatKnownError(error.message);
     if (knownMessage) return knownMessage;
-    if (isWalletSignerError(error.message)) return "Embedded wallet signer unavailable. Reconnect Privy before wallet actions.";
+    if (isWalletSignerError(error.message)) return "Access wallet signer unavailable. Reconnect Privy before wallet actions.";
     if (isWalletConnectionCancelled(error.message)) return "Wallet connection cancelled";
     try {
       const parsed = JSON.parse(error.message) as {
@@ -464,7 +472,7 @@ function parseApiError(error: unknown) {
       const parsedMessage = parsed.message ?? parsed.error ?? "";
       const knownParsedMessage = formatKnownError(parsedMessage);
       if (knownParsedMessage) return knownParsedMessage;
-      if (isWalletSignerError(parsedMessage)) return "Embedded wallet signer unavailable. Reconnect Privy before wallet actions.";
+      if (isWalletSignerError(parsedMessage)) return "Access wallet signer unavailable. Reconnect Privy before wallet actions.";
       if (isWalletConnectionCancelled(parsedMessage)) return "Wallet connection cancelled";
       if (parsed.error === "validation_error" && parsed.issues?.length) {
         const issue = parsed.issues[0];
@@ -512,7 +520,10 @@ function formatKnownError(message: string) {
     return "IP payment to the server wallet could not be verified.";
   }
   if (message === "buyer_wallet_mismatch") {
-    return "Embedded wallet changed. Reconnect the buyer wallet and try again.";
+    return "Access wallet changed. Reconnect the buyer wallet and try again.";
+  }
+  if (message === "buyer_wallet_not_connected") {
+    return "Connect the buyer wallet that owns this license token.";
   }
   return "";
 }
@@ -586,6 +597,114 @@ function buildAccessPreview(order: OrderSummary, plan: Awaited<ReturnType<typeof
   };
 }
 
+function wait(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function toCdrDebugValue(value: unknown, depth = 0): unknown {
+  if (depth > 4) return "[max_depth]";
+  if (typeof value === "bigint") return value.toString();
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      message: value.message,
+      stack: value.stack,
+      cause: value.cause ? toCdrDebugValue(value.cause, depth + 1) : undefined,
+    };
+  }
+  if (Array.isArray(value)) return value.map((item) => toCdrDebugValue(item, depth + 1));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, toCdrDebugValue(item, depth + 1)]));
+  }
+  return value;
+}
+
+function pushCdrDebugEvent(kind: "debug" | "error", stage: string, payload?: unknown) {
+  const event = {
+    kind,
+    stage,
+    at: new Date().toISOString(),
+    payload: toCdrDebugValue(payload),
+  };
+  const globalValue = globalThis as unknown as { __AXIOS_CDR_DEBUG__?: unknown[] };
+  globalValue.__AXIOS_CDR_DEBUG__ = [...(globalValue.__AXIOS_CDR_DEBUG__ ?? []), event].slice(-CDR_DEBUG_EVENT_LIMIT);
+  return event;
+}
+
+function formatCdrDebugPayload(payload: unknown) {
+  try {
+    return JSON.stringify(payload, null, 2);
+  } catch {
+    return String(payload);
+  }
+}
+
+function cdrDebug(stage: string, payload?: unknown) {
+  const event = pushCdrDebugEvent("debug", stage, payload);
+  console.debug("[axios-cdr]", stage, formatCdrDebugPayload(event.payload));
+}
+
+function cdrError(stage: string, error: unknown, payload?: unknown) {
+  const event = pushCdrDebugEvent("error", stage, { ...((payload && typeof payload === "object") ? payload : { payload }), error });
+  console.error("[axios-cdr]", stage, formatCdrDebugPayload(event.payload));
+}
+
+function getRequestAccessColumns(request: SearchRequestDetail) {
+  return ["profileRef", ...(request.wantedFields?.length ? request.wantedFields : request.recommendedFields)];
+}
+
+function mergeDecryptedRows(target: Map<string, DecryptedRow>, rows: DecryptedRow[]) {
+  rows.forEach((row) => {
+    const current = target.get(row.profileRef) ?? { profileRef: row.profileRef };
+    target.set(row.profileRef, { ...current, ...row });
+  });
+}
+
+async function getLicenseTransferReadyFieldIds(
+  orderPlans: Array<{ plan: Awaited<ReturnType<typeof getExportPlan>> }>,
+  pendingFieldIds: Set<string>,
+  buyerWallet: string,
+) {
+  const tokenIdsByField = new Map<string, string[]>();
+  orderPlans.forEach(({ plan }) => {
+    plan.items.forEach((item) => {
+      if (!pendingFieldIds.has(item.fieldId)) return;
+      tokenIdsByField.set(item.fieldId, item.licenseTokenIds ?? []);
+    });
+  });
+
+  const tokenIds = [...new Set([...tokenIdsByField.values()].flat())];
+  if (!tokenIds.length) {
+    cdrDebug("license_owner_check_skipped", {
+      reason: "no_token_ids",
+      pendingFieldIds: [...pendingFieldIds],
+    });
+    return new Set<string>();
+  }
+
+  cdrDebug("license_owner_check_start", {
+    buyerWallet,
+    pendingFieldIds: [...pendingFieldIds],
+    tokenIdsByField: Object.fromEntries(tokenIdsByField.entries()),
+  });
+  const ownerByTokenId = await readLicenseTokenOwners(tokenIds);
+  const normalizedBuyerWallet = buyerWallet.toLowerCase();
+  const readyFieldIds = new Set<string>();
+  tokenIdsByField.forEach((fieldTokenIds, fieldId) => {
+    if (fieldTokenIds.length && fieldTokenIds.every((tokenId) => ownerByTokenId[tokenId]?.toLowerCase() === normalizedBuyerWallet)) {
+      readyFieldIds.add(fieldId);
+    }
+  });
+
+  cdrDebug("license_owner_check_done", {
+    buyerWallet,
+    ownerByTokenId,
+    readyFieldIds: [...readyFieldIds],
+    notReadyFieldIds: [...pendingFieldIds].filter((fieldId) => !readyFieldIds.has(fieldId)),
+  });
+  return readyFieldIds;
+}
+
 function calculateFieldCostTotal(fieldCosts: QuoteFieldCost[]) {
   return fieldCosts.reduce((total, fieldCost) => total + fieldCost.priceCents, 0);
 }
@@ -646,6 +765,8 @@ export function AxiosApp() {
   const [detailMorePrompt, setDetailMorePrompt] = useState("");
   const [orders, setOrders] = useState<OrderSummary[]>([]);
   const [accessPreview, setAccessPreview] = useState<AccessPreviewState | null>(null);
+  const [requestAccessingId, setRequestAccessingId] = useState<string | null>(null);
+  const [requestAccessStatus, setRequestAccessStatus] = useState<RequestAccessStatusState | null>(null);
   const [sales, setSales] = useState<SaleSummary[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
@@ -662,15 +783,17 @@ export function AxiosApp() {
   const avatarInputRef = useRef<HTMLInputElement>(null);
   const profileMenuRef = useRef<HTMLDivElement>(null);
   const profileLoadedForRef = useRef("");
+  const accessedRequestKeyRef = useRef("");
+  const requestAccessRunRef = useRef(0);
 
   const embeddedWalletRecoveryState = useMemo(() => getEmbeddedWalletRecoveryState(user), [user]);
-  const activeWallet = useMemo(
-    () => (embeddedWalletRecoveryState.supported ? pickPrimaryPrivyWallet(wallets) : null),
-    [embeddedWalletRecoveryState.supported, wallets],
-  );
+  const activeWallet = useMemo(() => pickPrimaryPrivyWallet(wallets), [wallets]);
+  const activeWalletUsesEmbeddedRecovery = Boolean(activeWallet && isEmbeddedPrivyWallet(activeWallet));
+  const accessWalletRecoveryBlocked = activeWalletUsesEmbeddedRecovery && !embeddedWalletRecoveryState.supported;
   const connectedWallet: string | undefined =
-    walletsReady && embeddedWalletRecoveryState.supported ? activeWallet?.address ?? user?.wallet?.address : undefined;
+    walletsReady && !accessWalletRecoveryBlocked ? activeWallet?.address : undefined;
   const loginEmail = user?.email?.address?.trim() ?? "";
+  const loginWalletAddress = user?.wallet?.address?.trim() ?? "";
   const privyAccountEmail =
     [
       loginEmail,
@@ -689,13 +812,13 @@ export function AxiosApp() {
     user?.phone?.number ||
     user?.telegram?.username ||
     user?.twitter?.username ||
-    user?.wallet?.address ||
+    loginWalletAddress ||
     user?.id ||
     "";
   const profileAccountRows = authenticated
     ? [
         { label: "Privy account", value: privyLoginAccount },
-        { label: "Embedded wallet", value: connectedWallet ?? user?.wallet?.address ?? "" },
+        { label: "Access wallet", value: connectedWallet ?? "Not connected" },
       ].filter((row) => row.value)
     : [{ label: "Privy account", value: "Not signed in" }];
   const hasAppAccess = authenticated && appAuthReady;
@@ -732,6 +855,16 @@ export function AxiosApp() {
     if (!hasAppAccess) return;
     void refreshHistory();
   }, [connectedWallet, hasAppAccess]);
+
+  useEffect(() => {
+    if (!searchRequestDetail || !hasAppAccess || !connectedWallet) return;
+    const detailOrders = orders.filter((order) => order.quoteId === searchRequestDetail.id);
+    if (!detailOrders.length) return;
+    const accessKey = `${connectedWallet}:${searchRequestDetail.id}:${detailOrders.map((order) => `${order.id}:${order.updatedAt ?? order.createdAt}`).join("|")}`;
+    if (accessedRequestKeyRef.current === accessKey) return;
+    accessedRequestKeyRef.current = accessKey;
+    void accessRequestOwnedFields(searchRequestDetail, detailOrders);
+  }, [connectedWallet, hasAppAccess, orders, searchRequestDetail]);
 
   useEffect(() => {
     const profileLoadKey = `${user?.id || privyAccountEmail || ""}:${connectedWallet || ""}`;
@@ -1044,7 +1177,7 @@ export function AxiosApp() {
   }
 
   function requireWallet(action: string) {
-    if (authenticated && !embeddedWalletRecoveryState.supported) {
+    if (authenticated && accessWalletRecoveryBlocked) {
       setNotice(formatUnsupportedRecoveryMethodMessage(embeddedWalletRecoveryState.method));
       return undefined;
     }
@@ -1053,7 +1186,7 @@ export function AxiosApp() {
         login();
         setNotice(`Sign in to ${action}`);
       } else {
-        setNotice("Embedded wallet is still being prepared. Try again in a moment.");
+        setNotice("Access wallet is still being prepared. Try again in a moment.");
       }
       return undefined;
     }
@@ -1069,36 +1202,40 @@ export function AxiosApp() {
       login();
       return;
     }
-    if (!embeddedWalletRecoveryState.supported) {
+    if (accessWalletRecoveryBlocked) {
       setNotice(formatUnsupportedRecoveryMethodMessage(embeddedWalletRecoveryState.method));
       return;
     }
-    setNotice(connectedWallet ? "Embedded wallet ready" : "Embedded wallet is still being prepared");
+    setNotice(connectedWallet ? "Access wallet ready" : "Access wallet is still being prepared");
   }
 
-  function requireEmbeddedWallet(action: string) {
+  function requireAccessWallet(action: string) {
     if (!requireAppSession(action)) return undefined;
-    if (!embeddedWalletRecoveryState.supported) {
+    if (accessWalletRecoveryBlocked) {
       setNotice(formatUnsupportedRecoveryMethodMessage(embeddedWalletRecoveryState.method));
       return undefined;
     }
     if (!connectedWallet || !activeWallet) {
-      setNotice("Embedded wallet unavailable. Reconnect Privy before wallet actions.");
+      setNotice("Access wallet unavailable. Reconnect Privy before wallet actions.");
       return undefined;
     }
     return connectedWallet;
   }
 
-  async function getEmbeddedWalletConnection() {
-    if (!embeddedWalletRecoveryState.supported) {
+  async function getAccessWalletConnection(targetAddress?: string) {
+    if (accessWalletRecoveryBlocked) {
       throw new Error(formatUnsupportedRecoveryMethodMessage(embeddedWalletRecoveryState.method));
     }
-    if (!activeWallet) throw new Error("wallet_not_ready");
+    const wallet =
+      targetAddress
+        ? wallets.find((item) => item.address.toLowerCase() === targetAddress.toLowerCase())
+        : activeWallet;
+    if (!wallet) throw new Error(targetAddress ? "buyer_wallet_not_connected" : "wallet_not_ready");
     try {
-      return await getPrivyWalletConnection(activeWallet);
+      return await getPrivyWalletConnection(wallet);
     } catch (error) {
       if (error instanceof Error && isWalletSignerError(error.message)) {
-        throw new Error("Embedded wallet signer unavailable. Reconnect Privy before wallet actions.");
+        throw new Error("Access wallet signer unavailable. Reconnect Privy before wallet actions.");
       }
       throw error;
     }
@@ -1140,7 +1277,7 @@ export function AxiosApp() {
     const intent = await getOrderPaymentIntent(input);
     if (!isAddress(intent.payment.recipientWallet)) throw new Error("server_payment_wallet_invalid");
     setNotice(`Sending ${formatIpAmount(intent.payment.amountCents)} to server wallet`);
-    const walletConnection = await getEmbeddedWalletConnection();
+    const walletConnection = await getAccessWalletConnection(input.buyerWallet);
     if (walletConnection.account.toLowerCase() !== input.buyerWallet.toLowerCase()) throw new Error("buyer_wallet_mismatch");
     const txHash = await sendNativeIpPayment(walletConnection, {
       recipientWallet: intent.payment.recipientWallet,
@@ -1463,7 +1600,7 @@ export function AxiosApp() {
 
   async function handleCreateOrder() {
     if (!quote) return;
-    const buyerWallet = requireEmbeddedWallet("create batch access");
+    const buyerWallet = requireAccessWallet("create batch access");
     if (!buyerWallet) return;
     if (!selectedLicenseFields.length) {
       setNotice("No paid CDR fields selected");
@@ -1523,9 +1660,12 @@ export function AxiosApp() {
   }
 
   function closeSearchRequestDetail() {
+    requestAccessRunRef.current += 1;
     setSearchRequestDetail(null);
     setDetailSelectedFieldIds([]);
     setDetailMorePrompt("");
+    setRequestAccessingId(null);
+    setRequestAccessStatus(null);
   }
 
   function toggleDetailField(fieldId: string) {
@@ -1545,11 +1685,14 @@ export function AxiosApp() {
   async function openSearchRequestDetail(request: SearchRequestSummary) {
     setBusy(`request-${request.id}`);
     try {
+      requestAccessRunRef.current += 1;
       const response = await getSearchRequest(request.id);
       const purchasedFieldIds = purchasedFieldIdsForQuote(request.id);
       setSearchRequestDetail(response.request);
       setDetailSelectedFieldIds(requestFieldIds(response.request).filter((fieldId) => !purchasedFieldIds.has(fieldId)));
       setDetailMorePrompt("");
+      setRequestAccessingId(null);
+      setRequestAccessStatus(null);
     } catch (error) {
       setNotice(parseApiError(error));
     } finally {
@@ -1588,7 +1731,7 @@ export function AxiosApp() {
 
   async function handleCheckoutSearchRequestDetail() {
     if (!searchRequestDetail) return;
-    const buyerWallet = requireEmbeddedWallet("checkout request");
+    const buyerWallet = requireAccessWallet("checkout request");
     if (!buyerWallet) return;
     const selectedFieldIdSet = new Set(detailSelectedFieldIds);
     const selectedFieldCosts = getRequestFieldCosts(searchRequestDetail).filter((fieldCost) => selectedFieldIdSet.has(fieldCost.fieldId));
@@ -1610,6 +1753,11 @@ export function AxiosApp() {
       const paymentTxHash = await payServerWalletForOrder(orderInput);
       setNotice(`Issuing ${selectedFieldCosts.length} licenses on server`);
       const response = await createOrder({ ...orderInput, paymentTxHash });
+      setRequestAccessingId(searchRequestDetail.id);
+      setRequestAccessStatus({
+        requestId: searchRequestDetail.id,
+        pendingFieldIds: selectedFieldCosts.map((fieldCost) => fieldCost.fieldId),
+      });
       const detailResponse = await getSearchRequest(searchRequestDetail.id);
       setSearchRequestDetail(detailResponse.request);
       const availableFieldIds = new Set(requestFieldIds(detailResponse.request));
@@ -1662,11 +1810,11 @@ export function AxiosApp() {
   }
 
   async function viewOrderData(order: OrderSummary) {
-    if (!requireEmbeddedWallet("view CDR data")) return;
+    if (!requireAccessWallet("view CDR data")) return;
     setBusy(`view-${order.id}`);
     try {
       const plan = await getExportPlan(order.id);
-      const walletConnection = await getEmbeddedWalletConnection();
+      const walletConnection = await getAccessWalletConnection(order.buyerWallet);
       const result = await buildRowsFromExportPlan(plan, walletConnection);
       setAccessPreview(buildAccessPreview(order, plan, result));
       setNotice(result.successfulFieldIds.length ? `${result.successfulFieldIds.length} fields opened` : "No fields opened");
@@ -1677,12 +1825,231 @@ export function AxiosApp() {
     }
   }
 
+  async function accessRequestOwnedFields(request: SearchRequestDetail, detailOrders: OrderSummary[]) {
+    const requestFieldSet = new Set(requestFieldIds(request));
+    const relevantOrders = detailOrders.filter((order) => order.selectedFieldIds.some((fieldId) => requestFieldSet.has(fieldId)));
+    if (!relevantOrders.length) {
+      cdrDebug("request_access_no_orders", {
+        requestId: request.id,
+        detailOrderIds: detailOrders.map((order) => order.id),
+        requestFieldIds: [...requestFieldSet],
+      });
+      return;
+    }
+
+    const runId = requestAccessRunRef.current + 1;
+    requestAccessRunRef.current = runId;
+    const isCurrentRun = () => requestAccessRunRef.current === runId;
+    const rowsByProfile = new Map<string, DecryptedRow>();
+    const fieldValues: Record<string, string> = {};
+    const successfulFieldIds = new Set<string>();
+    const pendingFieldIds = new Set(relevantOrders.flatMap((order) => order.selectedFieldIds.filter((fieldId) => requestFieldSet.has(fieldId))));
+    const cdrReadAttemptedFieldIds = new Set<string>();
+    cdrDebug("request_access_start", {
+      runId,
+      requestId: request.id,
+      buyerWallet: request.buyerWallet,
+      orderIds: relevantOrders.map((order) => order.id),
+      pendingFieldIds: [...pendingFieldIds],
+      orderFields: relevantOrders.map((order) => ({
+        orderId: order.id,
+        selectedFieldIds: order.selectedFieldIds,
+        licenseTokenIds: order.licenseTokenIds,
+        grants: order.licenseTokenGrants,
+      })),
+    });
+    const publishAccessState = () => {
+      if (!isCurrentRun()) return;
+      setAccessPreview({
+        orderId: `request:${request.id}`,
+        prompt: request.prompt,
+        columns: getRequestAccessColumns(request),
+        rows: [...rowsByProfile.values()],
+        fieldValues: { ...fieldValues },
+        successfulFieldIds: [...successfulFieldIds],
+        failedFieldIds: [],
+        generatedAt: new Date().toISOString(),
+      });
+      setRequestAccessStatus({
+        requestId: request.id,
+        pendingFieldIds: [...pendingFieldIds],
+      });
+    };
+
+    setRequestAccessingId(request.id);
+    setRequestAccessStatus({
+      requestId: request.id,
+      pendingFieldIds: [...pendingFieldIds],
+    });
+    try {
+      const walletConnection = await getAccessWalletConnection(request.buyerWallet);
+      cdrDebug("request_access_wallet_ready", {
+        runId,
+        requestId: request.id,
+        buyerWallet: request.buyerWallet,
+        connectedAccount: walletConnection.account,
+      });
+      const orderPlans = await Promise.all(
+        relevantOrders.map(async (order) => ({
+          order,
+          plan: await getExportPlan(order.id),
+        })),
+      );
+      cdrDebug("request_access_export_plans_loaded", {
+        runId,
+        requestId: request.id,
+        plans: orderPlans.map(({ order, plan }) => ({
+          orderId: order.id,
+          itemCount: plan.items.length,
+          items: plan.items.map((item) => ({
+            fieldId: item.fieldId,
+            kind: item.kind,
+            cdrVaultUuid: item.cdrVaultUuid,
+            licenseTokenIds: item.licenseTokenIds,
+            accessAuxData: item.accessAuxData,
+          })),
+        })),
+      });
+
+      while (pendingFieldIds.size && isCurrentRun()) {
+        const unattemptedPendingFieldIds = new Set([...pendingFieldIds].filter((fieldId) => !cdrReadAttemptedFieldIds.has(fieldId)));
+        if (!unattemptedPendingFieldIds.size) {
+          cdrDebug("request_access_waiting_for_retry", {
+            runId,
+            requestId: request.id,
+            pendingFieldIds: [...pendingFieldIds],
+            attemptedFieldIds: [...cdrReadAttemptedFieldIds],
+            successfulFieldIds: [...successfulFieldIds],
+          });
+          publishAccessState();
+          break;
+        }
+
+        cdrDebug("request_access_iteration", {
+          runId,
+          requestId: request.id,
+          pendingFieldIds: [...pendingFieldIds],
+          unattemptedPendingFieldIds: [...unattemptedPendingFieldIds],
+          attemptedFieldIds: [...cdrReadAttemptedFieldIds],
+        });
+        const transferReadyFieldIds = await getLicenseTransferReadyFieldIds(orderPlans, unattemptedPendingFieldIds, request.buyerWallet);
+        if (!transferReadyFieldIds.size) {
+          cdrDebug("request_access_transfer_not_ready", {
+            runId,
+            requestId: request.id,
+            pendingFieldIds: [...pendingFieldIds],
+            unattemptedPendingFieldIds: [...unattemptedPendingFieldIds],
+          });
+          publishAccessState();
+          await wait(REQUEST_ACCESS_POLL_DELAY_MS);
+          continue;
+        }
+
+        const accessResults = await Promise.all(
+          orderPlans.map(async ({ order, plan }) => {
+            const filteredItems = plan.items.filter((item) => pendingFieldIds.has(item.fieldId) && transferReadyFieldIds.has(item.fieldId));
+            if (!filteredItems.length) return null;
+            const filteredPlan = { ...plan, items: filteredItems };
+            filteredItems.forEach((item) => cdrReadAttemptedFieldIds.add(item.fieldId));
+            cdrDebug("request_access_cdr_read_start", {
+              runId,
+              requestId: request.id,
+              orderId: order.id,
+              fields: filteredItems.map((item) => ({
+                fieldId: item.fieldId,
+                kind: item.kind,
+                cdrVaultUuid: item.cdrVaultUuid,
+                licenseTokenIds: item.licenseTokenIds,
+                accessAuxData: item.accessAuxData,
+              })),
+            });
+            const result = await buildRowsFromExportPlan(filteredPlan, walletConnection, {
+              logFailures: false,
+              onFailure: (failure) => {
+                cdrError("request_access_cdr_read_failed", failure.error, {
+                  runId,
+                  requestId: request.id,
+                  orderId: order.id,
+                  fieldId: failure.fieldId,
+                  kind: failure.kind,
+                  cdrVaultUuid: failure.cdrVaultUuid,
+                  licenseTokenIds: failure.licenseTokenIds,
+                  accessAuxData: failure.accessAuxData,
+                });
+              },
+            });
+            cdrDebug("request_access_cdr_read_result", {
+              runId,
+              requestId: request.id,
+              orderId: order.id,
+              successfulFieldIds: result.successfulFieldIds,
+              failedFieldIds: result.failedFieldIds,
+              rows: result.rows,
+            });
+            return buildAccessPreview(order, filteredPlan, result);
+          }),
+        );
+
+        accessResults.forEach((preview) => {
+          if (!preview) return;
+          Object.assign(fieldValues, preview.fieldValues);
+          mergeDecryptedRows(rowsByProfile, preview.rows);
+          preview.successfulFieldIds.forEach((fieldId) => {
+            successfulFieldIds.add(fieldId);
+            pendingFieldIds.delete(fieldId);
+          });
+        });
+
+        publishAccessState();
+        if (pendingFieldIds.size) await wait(REQUEST_ACCESS_POLL_DELAY_MS);
+      }
+      cdrDebug("request_access_complete", {
+        runId,
+        requestId: request.id,
+        successfulFieldIds: [...successfulFieldIds],
+        pendingFieldIds: [...pendingFieldIds],
+        attemptedFieldIds: [...cdrReadAttemptedFieldIds],
+      });
+    } catch (error) {
+      accessedRequestKeyRef.current = "";
+      cdrError("request_access_error", error, {
+        runId,
+        requestId: request.id,
+        buyerWallet: request.buyerWallet,
+        pendingFieldIds: [...pendingFieldIds],
+        attemptedFieldIds: [...cdrReadAttemptedFieldIds],
+      });
+      setNotice(parseApiError(error));
+    } finally {
+      if (isCurrentRun()) {
+        setRequestAccessingId(null);
+      }
+    }
+  }
+
+  async function retryRequestFieldAccess(request: SearchRequestDetail) {
+    if (!requireAccessWallet("request CDR access")) return;
+    const detailOrders = orders.filter((order) => order.quoteId === request.id);
+    cdrDebug("request_access_retry_clicked", {
+      requestId: request.id,
+      buyerWallet: request.buyerWallet,
+      orderIds: detailOrders.map((order) => order.id),
+      selectedFieldIds: detailOrders.flatMap((order) => order.selectedFieldIds),
+    });
+    if (!detailOrders.length) {
+      setNotice("No purchased fields to access");
+      return;
+    }
+    accessedRequestKeyRef.current = "";
+    await accessRequestOwnedFields(request, detailOrders);
+  }
+
   async function exportOrder(order: OrderSummary, format: "csv" | "xlsx") {
-    if (!requireEmbeddedWallet("export CDR")) return;
+    if (!requireAccessWallet("export CDR")) return;
     setBusy(`export-${order.id}`);
     try {
       const plan = await getExportPlan(order.id);
-      const walletConnection = await getEmbeddedWalletConnection();
+      const walletConnection = await getAccessWalletConnection(order.buyerWallet);
       const result = await buildRowsFromExportPlan(plan, walletConnection);
       setAccessPreview(buildAccessPreview(order, plan, result));
       if (format === "csv") downloadCsv(`${order.id}.csv`, result.rows);
@@ -1706,10 +2073,10 @@ export function AxiosApp() {
       setNotice("Field IP is missing for royalty claim");
       return;
     }
-    if (!requireEmbeddedWallet("claim royalties")) return;
+    if (!requireAccessWallet("claim royalties")) return;
     setBusy(`claim-${sale.id}`);
     try {
-      const walletConnection = await getEmbeddedWalletConnection();
+      const walletConnection = await getAccessWalletConnection();
       const { claimFieldRoyalty } = await import("../lib/web3/royalty");
       const result = await claimFieldRoyalty(walletConnection, {
         ipId: sale.cdrLicenseIpId,
@@ -1794,8 +2161,8 @@ export function AxiosApp() {
   }
 
   function renderWalletSummary() {
-    const embeddedWallet = connectedWallet;
-    const hasWallet = Boolean(embeddedWallet);
+    const accessWallet = connectedWallet;
+    const hasWallet = Boolean(accessWallet);
 
     return (
       <div className={hasWallet ? "data-wallet-lock connected" : "data-wallet-lock"}>
@@ -1803,23 +2170,23 @@ export function AxiosApp() {
           {hasWallet ? (
             <div className="wallet-copy-item">
               <div className="wallet-label-row">
-                <span>Embedded wallet</span>
-                <span className="wallet-help" aria-label="Privy embedded wallet" role="img" tabIndex={0}>
+                <span>Access wallet</span>
+                <span className="wallet-help" aria-label="Access wallet" role="img" tabIndex={0}>
                   ?
-                  <span className="wallet-tooltip">Receives the field IPA. Server wallet deploys CDR; this wallet signs buyer access and royalty claims.</span>
+                  <span className="wallet-tooltip">Receives license tokens, signs CDR reads, and sends IP payment to the server wallet.</span>
                 </span>
               </div>
               <div className="wallet-value-row">
-                <button className="wallet-copy-button" type="button" aria-label="Copy embedded wallet" onClick={() => void handleCopyWallet(embeddedWallet ?? "", "Embedded wallet")}>
+                <button className="wallet-copy-button" type="button" aria-label="Copy access wallet" onClick={() => void handleCopyWallet(accessWallet ?? "", "Access wallet")}>
                   <Copy size={14} />
                 </button>
-                <p className="wallet-address-text">{embeddedWallet}</p>
+                <p className="wallet-address-text">{accessWallet}</p>
               </div>
             </div>
           ) : (
             <>
-              <span>Embedded wallet required</span>
-              <p>Basic data works now. IPA ownership, paid access, export, and royalty claims use your Privy embedded wallet.</p>
+              <span>Access wallet required</span>
+              <p>Paid access and CDR export use the connected wallet that receives the license token.</p>
             </>
           )}
         </div>
@@ -1873,7 +2240,7 @@ export function AxiosApp() {
                         <span>{row.label}</span>
                         <strong title={row.value}>{row.value}</strong>
                       </div>
-                      {row.label.toLowerCase().includes("wallet") ? (
+                      {isAddress(row.value) ? (
                         <button
                           className="profile-account-copy-button"
                           type="button"
@@ -2511,7 +2878,11 @@ export function AxiosApp() {
       const detailSelectedTotal = calculateFieldCostTotal(detailSelectedFieldCosts);
       const checkoutBusy = busy === `request-checkout-${searchRequestDetail.id}`;
       const extendBusy = busy === `request-extend-${searchRequestDetail.id}`;
-      const openedFieldValues = accessPreview?.fieldValues ?? {};
+      const requestAccessPreview = accessPreview?.orderId === `request:${searchRequestDetail.id}` ? accessPreview : null;
+      const openedFieldValues = requestAccessPreview?.fieldValues ?? {};
+      const failedAccessFieldIds = new Set(requestAccessPreview?.failedFieldIds ?? []);
+      const pendingAccessFieldIds = new Set(requestAccessStatus?.requestId === searchRequestDetail.id ? requestAccessStatus.pendingFieldIds : []);
+      const requestAccessing = requestAccessingId === searchRequestDetail.id;
       return (
         <div className="list-screen request-detail-screen">
           <div className="screen-title">
@@ -2618,22 +2989,38 @@ export function AxiosApp() {
                                 const purchasedOrder = purchasedOrderByFieldId.get(fieldCost.fieldId);
                                 const openedValue = openedFieldValues[fieldCost.fieldId];
                                 if (purchasedOrder) {
-                                  return (
-                                    <div className={openedValue ? "request-field-option purchased opened" : "request-field-option purchased"} key={fieldCost.fieldId}>
-                                      <span className="checkout-field-slot">LV1</span>
-                                      <span className="request-field-name">{fieldCost.label}</span>
-                                      <span className="request-field-value">{openedValue || "Purchased"}</span>
-                                      <button
-                                        type="button"
-                                        onClick={() => void viewOrderData(purchasedOrder)}
-                                        disabled={busy === `view-${purchasedOrder.id}`}
-                                      >
-                                        {busy === `view-${purchasedOrder.id}` ? <span className="button-spinner" aria-hidden="true" /> : <Eye size={15} />}
-                                        Data
-                                      </button>
-                                    </div>
-                                  );
-                                }
+                                  const accessPending = !openedValue && requestAccessing && pendingAccessFieldIds.has(fieldCost.fieldId);
+                                  const valueClassName = [
+                                    "request-field-value",
+                                    failedAccessFieldIds.has(fieldCost.fieldId) ? "failed" : "",
+                                    accessPending ? "pending" : "",
+                                  ]
+                                    .filter(Boolean)
+                                    .join(" ");
+	                                  return (
+	                                    <div className={openedValue ? "request-field-option purchased opened" : "request-field-option purchased"} key={fieldCost.fieldId}>
+	                                      <span className="checkout-field-slot">LV1</span>
+	                                      <span className="request-field-name">{fieldCost.label}</span>
+	                                      {openedValue || failedAccessFieldIds.has(fieldCost.fieldId) || accessPending ? (
+	                                        <span className={valueClassName}>
+	                                          {openedValue || failedAccessFieldIds.has(fieldCost.fieldId) ? (
+	                                            openedValue || "Access failed"
+	                                          ) : (
+	                                            <>
+	                                              <span className="button-spinner" aria-hidden="true" />
+	                                              Confirming access
+	                                            </>
+	                                          )}
+	                                        </span>
+	                                      ) : (
+	                                        <button type="button" onClick={() => void retryRequestFieldAccess(searchRequestDetail)}>
+	                                          <Eye size={15} />
+	                                          Request data
+	                                        </button>
+	                                      )}
+	                                    </div>
+	                                  );
+	                                }
                                 const fieldSelected = detailSelectedFieldSet.has(fieldCost.fieldId);
                                 return (
                                   <label className={fieldSelected ? "request-field-option selected" : "request-field-option"} key={fieldCost.fieldId}>
@@ -2742,14 +3129,7 @@ export function AxiosApp() {
           </section>
         ) : null}
 
-        {orders.length ? (
-          <section className="history-section" aria-label="Batch requests">
-            <h2>Batch requests</h2>
-            {orders.map((order) => renderOrderHistoryBlock(order))}
-          </section>
-        ) : null}
-
-        {!searchRequests.length && !orders.length ? (
+        {!searchRequests.length ? (
           <EmptyState icon={<IconAsset name="collectbox" size={28} />} title="No requests yet" />
         ) : null}
       </div>

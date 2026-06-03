@@ -34,10 +34,6 @@ async function ensureWasm(initWasm: () => Promise<void>) {
   await wasmReady;
 }
 
-async function importAtRuntime<T>(specifier: string): Promise<T> {
-  return new Function("modulePath", "return import(modulePath)")(specifier) as Promise<T>;
-}
-
 function emitStage(options: DeployInlineCdrVaultOptions | undefined, key: CdrDeployStage, message: string) {
   options?.onStageChange?.({ key, message });
 }
@@ -50,6 +46,34 @@ function decodeVaultPayload(dataKey: Uint8Array) {
   const payload = JSON.parse(new TextDecoder().decode(dataKey)) as { value?: unknown };
   if (typeof payload.value !== "string") throw new Error("invalid_cdr_payload");
   return payload.value;
+}
+
+function serializeCdrError(error: unknown) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+      cause: error.cause,
+    };
+  }
+  return error;
+}
+
+function formatCdrLogPayload(payload: unknown) {
+  try {
+    return JSON.stringify(payload, null, 2);
+  } catch {
+    return String(payload);
+  }
+}
+
+function cdrLog(stage: string, payload: unknown) {
+  console.debug("[axios-cdr]", stage, formatCdrLogPayload(payload));
+}
+
+function cdrLogError(stage: string, payload: unknown) {
+  console.error("[axios-cdr]", stage, formatCdrLogPayload(payload));
 }
 
 function normalizeCdrUuid(uuid: string | number) {
@@ -71,11 +95,11 @@ export async function deployInlineCdrVaultBatch(
   emitStage(options, "connect_wallet", "Preparing wallet");
 
   const [{ Observer }, { Uploader }, { conditions }, { uuidToLabel }, { initWasm }, viem] = await Promise.all([
-    importAtRuntime<typeof import("@piplabs/cdr-sdk/dist/observer.js")>("@piplabs/cdr-sdk/dist/observer.js"),
-    importAtRuntime<typeof import("@piplabs/cdr-sdk/dist/uploader.js")>("@piplabs/cdr-sdk/dist/uploader.js"),
-    importAtRuntime<typeof import("@piplabs/cdr-sdk/dist/conditions.js")>("@piplabs/cdr-sdk/dist/conditions.js"),
-    importAtRuntime<typeof import("@piplabs/cdr-sdk/dist/label.js")>("@piplabs/cdr-sdk/dist/label.js"),
-    importAtRuntime<typeof import("@piplabs/cdr-crypto")>("@piplabs/cdr-crypto"),
+    import("@piplabs/cdr-sdk/dist/observer.js"),
+    import("@piplabs/cdr-sdk/dist/uploader.js"),
+    import("@piplabs/cdr-sdk/dist/conditions.js"),
+    import("@piplabs/cdr-sdk/dist/label.js"),
+    import("@piplabs/cdr-crypto"),
     import("viem"),
   ]);
   await ensureWasm(initWasm);
@@ -148,11 +172,22 @@ export async function readInlineCdrVault(wallet: PrivyWalletConnection, item: Ex
   if (!item.accessAuxData || item.accessAuxData === "0x") throw new Error("cdr_access_aux_data_missing");
 
   const apiUrl = `${API_BASE_URL.replace(/\/+$/, "")}/cdr-api`;
+  const uuid = normalizeCdrUuid(item.cdrVaultUuid);
   const { walletClient } = wallet;
+  cdrLog("read_inline_start", {
+    account: wallet.account,
+    fieldId: item.fieldId,
+    kind: item.kind,
+    cdrVaultUuid: item.cdrVaultUuid,
+    uuid,
+    licenseTokenIds: item.licenseTokenIds,
+    accessAuxData: item.accessAuxData,
+    apiUrl,
+  });
   const [{ Observer }, { Consumer }, { initWasm }, viem] = await Promise.all([
-    importAtRuntime<typeof import("@piplabs/cdr-sdk/dist/observer.js")>("@piplabs/cdr-sdk/dist/observer.js"),
-    importAtRuntime<typeof import("@piplabs/cdr-sdk/dist/consumer.js")>("@piplabs/cdr-sdk/dist/consumer.js"),
-    importAtRuntime<typeof import("@piplabs/cdr-crypto")>("@piplabs/cdr-crypto"),
+    import("@piplabs/cdr-sdk/dist/observer.js"),
+    import("@piplabs/cdr-sdk/dist/consumer.js"),
+    import("@piplabs/cdr-crypto"),
     import("viem"),
   ]);
   await ensureWasm(initWasm);
@@ -174,11 +209,36 @@ export async function readInlineCdrVault(wallet: PrivyWalletConnection, item: Ex
     apiUrl,
   });
 
-  const { dataKey } = await consumer.accessCDR({
-    uuid: normalizeCdrUuid(item.cdrVaultUuid),
-    accessAuxData: item.accessAuxData as `0x${string}`,
-    timeoutMs: 120_000,
-  });
+  let dataKey: Uint8Array;
+  try {
+    const result = await consumer.accessCDR({
+      uuid,
+      accessAuxData: item.accessAuxData as `0x${string}`,
+      timeoutMs: 120_000,
+    });
+    dataKey = result.dataKey;
+    cdrLog("read_inline_success", {
+      account: wallet.account,
+      fieldId: item.fieldId,
+      kind: item.kind,
+      cdrVaultUuid: item.cdrVaultUuid,
+      uuid,
+      txHash: result.txHash,
+      dataKeyBytes: dataKey.length,
+    });
+  } catch (error) {
+    cdrLogError("read_inline_error", {
+      account: wallet.account,
+      fieldId: item.fieldId,
+      kind: item.kind,
+      cdrVaultUuid: item.cdrVaultUuid,
+      uuid,
+      licenseTokenIds: item.licenseTokenIds,
+      accessAuxData: item.accessAuxData,
+      error: serializeCdrError(error),
+    });
+    throw error;
+  }
 
   return decodeVaultPayload(dataKey);
 }

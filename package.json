@@ -17,6 +17,7 @@
     "dayjs": "^1.11.13",
     "fflate": "^0.8.3",
     "lucide-react": "^0.400.0",
+    "multiformats": "^13.4.2",
     "next": "14.2.15",
     "ox": "0.8.9",
     "permissionless": "^0.2.57",

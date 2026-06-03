@@ -2323,10 +2323,29 @@
 
 .request-field-value {
   color: var(--accent);
+  grid-column: 3 / -1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.request-field-value.failed {
+  color: #8b1e1e;
+}
+
+.request-field-value.pending {
+  align-items: center;
+  color: #6f737a;
+  display: inline-flex;
+  gap: 8px;
+}
+
+.request-field-value.pending .button-spinner {
+  border-color: rgba(16, 18, 20, 0.18);
+  border-top-color: #111315;
+  height: 13px;
+  width: 13px;
 }
 
 .request-field-option.purchased button {

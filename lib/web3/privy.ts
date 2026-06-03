@@ -15,6 +15,18 @@ export function pickPrimaryPrivyWallet(wallets: ConnectedWallet[]) {
   return wallets[0] ?? null;
 }
 
+export function isEmbeddedPrivyWallet(wallet: ConnectedWallet) {
+  return wallet.walletClientType === "privy" || wallet.walletClientType === "privy-v2";
+}
+
+export function pickEmbeddedPrivyWallet(wallets: ConnectedWallet[]) {
+  return wallets.find(isEmbeddedPrivyWallet) ?? null;
+}
+
+export function pickPaymentPrivyWallet(wallets: ConnectedWallet[]) {
+  return wallets.find((wallet) => wallet.walletClientType === "metamask") ?? null;
+}
+
 export async function getPrivyWalletConnection(wallet: ConnectedWallet): Promise<PrivyWalletConnection> {
   await wallet.switchChain(STORY_AENEID_CHAIN.id);
   const provider = (await wallet.getEthereumProvider()) as Eip1193Provider;

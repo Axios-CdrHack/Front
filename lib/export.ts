@@ -14,11 +14,38 @@ export interface ExportResult {
   failedFieldIds: string[];
 }
 
+export type ExportFailure = {
+  fieldId: string;
+  kind: string;
+  cdrVaultUuid?: string;
+  licenseTokenIds: string[];
+  accessAuxData: string;
+  error: unknown;
+};
+
+export type BuildRowsOptions = {
+  logFailures?: boolean;
+  onFailure?(failure: ExportFailure): void;
+};
+
 async function decryptCdrSlot(item: ExportPlan["items"][number], wallet: PrivyWalletConnection): Promise<string> {
   return readInlineCdrVault(wallet, item);
 }
 
-export async function buildRowsFromExportPlan(plan: ExportPlan, wallet: PrivyWalletConnection): Promise<ExportResult> {
+function serializeError(error: unknown) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+      cause: error.cause,
+    };
+  }
+  return error;
+}
+
+export async function buildRowsFromExportPlan(plan: ExportPlan, wallet: PrivyWalletConnection, options: BuildRowsOptions = {}): Promise<ExportResult> {
+  const logFailures = options.logFailures ?? true;
   const rowsByProfile = new Map<string, DecryptedRow>();
   const successfulFieldIds: string[] = [];
   const failedFieldIds: string[] = [];
@@ -29,7 +56,22 @@ export async function buildRowsFromExportPlan(plan: ExportPlan, wallet: PrivyWal
       row[item.kind] = await decryptCdrSlot(item, wallet);
       rowsByProfile.set(item.profileRef, row);
       successfulFieldIds.push(item.fieldId);
-    } catch {
+    } catch (error) {
+      const failure: ExportFailure = {
+        fieldId: item.fieldId,
+        kind: item.kind,
+        cdrVaultUuid: item.cdrVaultUuid,
+        licenseTokenIds: item.licenseTokenIds,
+        accessAuxData: item.accessAuxData,
+        error,
+      };
+      options.onFailure?.(failure);
+      if (logFailures) {
+        console.error("[axios-cdr] field_access_failed", {
+          ...failure,
+          error: serializeError(error),
+        });
+      }
       failedFieldIds.push(item.fieldId);
     }
   }
