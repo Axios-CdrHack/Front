@@ -10,6 +10,7 @@ import {
   ChevronDown,
   Copy,
   Download,
+  Eye,
   FileText,
   GripVertical,
   Lock,
@@ -19,12 +20,13 @@ import {
   RotateCcw,
   Search,
   Trash2,
+  X,
 } from "lucide-react";
 import { IconAsset, type IconAssetName } from "./sys/cell/IconAsset";
 import { ConfirmModal } from "./sys/org/ConfirmModal";
 import { CdrDeployModal } from "./sys/org/CdrDeployModal";
 import { clearAppAuthSession, exchangePrivyJwtForAppSession } from "../lib/appAuth";
-import { buildRowsFromExportPlan, downloadCsv, downloadXlsx } from "../lib/export";
+import { buildRowsFromExportPlan, downloadCsv, downloadXlsx, type DecryptedRow, type ExportResult } from "../lib/export";
 import { compactAddress, formatIpAmount } from "../lib/format";
 import {
   confirmVerification,
@@ -33,6 +35,7 @@ import {
   extendSearchRequest,
   getExportPlan,
   getMyProfile,
+  getOrderPaymentIntent,
   getQuote,
   getSearchRequest,
   listOrders,
@@ -45,6 +48,7 @@ import {
   upsertField,
   upsertProfile,
 } from "../lib/api";
+import { sendNativeIpPayment } from "../lib/web3/payment";
 import { getPrivyWalletConnection, pickPrimaryPrivyWallet } from "../lib/web3/privy";
 import { formatUnsupportedRecoveryMethodMessage, getEmbeddedWalletRecoveryState } from "../lib/web3/privyRecovery";
 import type {
@@ -130,6 +134,16 @@ type SearchWorkflowState = {
   prompt: string;
   progress: number;
   stageIndex: number;
+};
+type AccessPreviewState = {
+  orderId: string;
+  prompt: string;
+  columns: string[];
+  rows: DecryptedRow[];
+  fieldValues: Record<string, string>;
+  successfulFieldIds: string[];
+  failedFieldIds: string[];
+  generatedAt: string;
 };
 type HistorySection = "education" | "career";
 type HistoryDragState = {
@@ -473,6 +487,33 @@ function formatKnownError(message: string) {
   if (message === "field_license_config_missing" || message === "no_purchasable_fields") {
     return "This CDR is not ready for on-chain license minting. Search again after the field deploy is complete.";
   }
+  if (message === "license_native_ip_balance_insufficient" || normalized.includes("license_native_ip_balance_insufficient")) {
+    return "Server wallet needs more native IP to wrap the missing WIP.";
+  }
+  if (message === "license_fee_balance_insufficient" || normalized.includes("license_fee_balance_insufficient")) {
+    return "Server wallet does not have enough license fee token for this checkout.";
+  }
+  if (
+    message === "license_token_mint_failed" ||
+    message === "license_token_mint_event_missing" ||
+    normalized.includes("server_license_mint_failed") ||
+    normalized.includes("license_token_mint_failed") ||
+    normalized.includes("license_token_transfer_failed")
+  ) {
+    return "Server license issuance failed. Check the Django mint logs for the failed field.";
+  }
+  if (
+    message === "server_ip_payment_failed" ||
+    message === "server_payment_wallet_invalid" ||
+    normalized.includes("payment_tx_") ||
+    normalized.includes("invalid_payment") ||
+    normalized.includes("server_ip_payment_failed")
+  ) {
+    return "IP payment to the server wallet could not be verified.";
+  }
+  if (message === "buyer_wallet_mismatch") {
+    return "Embedded wallet changed. Reconnect the buyer wallet and try again.";
+  }
   return "";
 }
 
@@ -510,6 +551,39 @@ function calculateRequestMatchSubtotal(match: QuoteMatch) {
 
 function getRequestFieldCosts(request: SearchRequestDetail) {
   return request.matches.flatMap((match) => match.fieldCosts);
+}
+
+function formatAccessColumnLabel(column: string) {
+  if (column === "profileRef") return "Card";
+  return fieldLabelByKind.get(column as DataFieldKind) ?? column;
+}
+
+function buildAccessPreview(order: OrderSummary, plan: Awaited<ReturnType<typeof getExportPlan>>, result: ExportResult): AccessPreviewState {
+  const successfulFieldIds = new Set(result.successfulFieldIds);
+  const successfulColumns = new Set(plan.items.filter((item) => successfulFieldIds.has(item.fieldId)).map((item) => item.kind));
+  const rowByProfile = new Map(result.rows.map((row) => [row.profileRef, row]));
+  const fieldValues = Object.fromEntries(
+    plan.items
+      .filter((item) => successfulFieldIds.has(item.fieldId))
+      .map((item) => [item.fieldId, rowByProfile.get(item.profileRef)?.[item.kind] ?? ""])
+      .filter(([, value]) => Boolean(value)),
+  );
+  const columns = [
+    "profileRef",
+    ...plan.columns.filter((column) => successfulColumns.has(column)),
+    ...result.rows.flatMap((row) => Object.keys(row).filter((column) => column !== "profileRef" && !successfulColumns.has(column as DataFieldKind))),
+  ];
+
+  return {
+    orderId: order.id,
+    prompt: order.prompt,
+    columns: [...new Set(columns)],
+    rows: result.rows,
+    fieldValues,
+    successfulFieldIds: result.successfulFieldIds,
+    failedFieldIds: result.failedFieldIds,
+    generatedAt: new Date().toISOString(),
+  };
 }
 
 function calculateFieldCostTotal(fieldCosts: QuoteFieldCost[]) {
@@ -571,6 +645,7 @@ export function AxiosApp() {
   const [detailSelectedFieldIds, setDetailSelectedFieldIds] = useState<string[]>([]);
   const [detailMorePrompt, setDetailMorePrompt] = useState("");
   const [orders, setOrders] = useState<OrderSummary[]>([]);
+  const [accessPreview, setAccessPreview] = useState<AccessPreviewState | null>(null);
   const [sales, setSales] = useState<SaleSummary[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
@@ -1029,7 +1104,7 @@ export function AxiosApp() {
     }
   }
 
-  async function mintLicenseBatchForFields(fieldCosts: QuoteFieldCost[], buyerWallet: string) {
+  function validateServerLicenseMintFields(fieldCosts: QuoteFieldCost[], buyerWallet: string) {
     const debugFields = fieldCosts.map((field) => ({
       fieldId: field.fieldId,
       kind: field.kind,
@@ -1040,8 +1115,8 @@ export function AxiosApp() {
       ipaTokenId: field.ipaTokenId,
       licenseConfigTxHash: field.licenseConfigTxHash,
     }));
-    console.debug("[axios-mint] checkout_prepare", { buyerWallet, fieldCount: fieldCosts.length, fields: debugFields });
-    const mintInputs = fieldCosts.map((field) => {
+    console.debug("[axios-mint] server_checkout_prepare", { buyerWallet, fieldCount: fieldCosts.length, fields: debugFields });
+    fieldCosts.forEach((field) => {
       if (
         !isAddress(field.cdrLicenseIpId) ||
         !isUintString(field.cdrLicenseTermsId) ||
@@ -1051,25 +1126,33 @@ export function AxiosApp() {
       ) {
         throw new Error("field_license_config_missing");
       }
-      return {
-        fieldId: field.fieldId,
-        licensorIpId: field.cdrLicenseIpId,
-        licenseTermsId: field.cdrLicenseTermsId,
-        receiver: buyerWallet as `0x${string}`,
-      };
     });
-    setNotice(`Minting ${mintInputs.length} licenses`);
-    try {
-      const walletConnection = await getEmbeddedWalletConnection();
-      console.debug("[axios-mint] wallet_ready", { account: walletConnection.account, fieldCount: mintInputs.length });
-      const { mintStoryLicenseTokensBatch } = await import("../lib/web3/license");
-      const grants = await mintStoryLicenseTokensBatch(walletConnection, mintInputs);
-      console.debug("[axios-mint] checkout_mint_success", { grantCount: grants.length, grants });
-      return grants;
-    } catch (error) {
-      console.error("[axios-mint] checkout_mint_failed", { buyerWallet, fieldCount: fieldCosts.length, fields: debugFields, error });
-      throw error;
-    }
+  }
+
+  async function payServerWalletForOrder(input: {
+    quoteId?: string;
+    buyerWallet: string;
+    prompt: string;
+    wantedFields: DataFieldKind[];
+    selectedMatchRefs?: string[];
+    selectedFieldIds?: string[];
+  }) {
+    const intent = await getOrderPaymentIntent(input);
+    if (!isAddress(intent.payment.recipientWallet)) throw new Error("server_payment_wallet_invalid");
+    setNotice(`Sending ${formatIpAmount(intent.payment.amountCents)} to server wallet`);
+    const walletConnection = await getEmbeddedWalletConnection();
+    if (walletConnection.account.toLowerCase() !== input.buyerWallet.toLowerCase()) throw new Error("buyer_wallet_mismatch");
+    const txHash = await sendNativeIpPayment(walletConnection, {
+      recipientWallet: intent.payment.recipientWallet,
+      amountWei: intent.payment.amountWei,
+    });
+    console.debug("[axios-payment] server_ip_payment_success", {
+      txHash,
+      recipientWallet: intent.payment.recipientWallet,
+      amountWei: intent.payment.amountWei,
+      fieldCount: intent.payment.fieldCount,
+    });
+    return txHash;
   }
 
   async function handleCopyWallet(value: string, label: string) {
@@ -1388,16 +1471,17 @@ export function AxiosApp() {
     }
     setBusy("order");
     try {
-      const licenseTokenGrants = await mintLicenseBatchForFields(selectedLicenseFields, buyerWallet);
-      const response = await createOrder({
+      validateServerLicenseMintFields(selectedLicenseFields, buyerWallet);
+      const orderInput = {
         quoteId: quote.quoteId,
         buyerWallet,
         prompt,
         wantedFields: selectedFields,
         selectedMatchRefs: selectedMatches,
-        licenseTokenGrants,
-        paymentTxHash: licenseTokenGrants[0]?.mintTxHash,
-      });
+      };
+      const paymentTxHash = await payServerWalletForOrder(orderInput);
+      setNotice(`Issuing ${selectedLicenseFields.length} licenses on server`);
+      const response = await createOrder({ ...orderInput, paymentTxHash });
       setNotice(`Batch request ${response.order.id} created`);
       await refreshHistory(buyerWallet);
       setActiveTab("requests");
@@ -1434,6 +1518,10 @@ export function AxiosApp() {
     return getRequestFieldCosts(request).map((fieldCost) => fieldCost.fieldId);
   }
 
+  function purchasedFieldIdsForQuote(quoteId: string) {
+    return new Set(orders.filter((order) => order.quoteId === quoteId).flatMap((order) => order.selectedFieldIds));
+  }
+
   function closeSearchRequestDetail() {
     setSearchRequestDetail(null);
     setDetailSelectedFieldIds([]);
@@ -1458,8 +1546,9 @@ export function AxiosApp() {
     setBusy(`request-${request.id}`);
     try {
       const response = await getSearchRequest(request.id);
+      const purchasedFieldIds = purchasedFieldIdsForQuote(request.id);
       setSearchRequestDetail(response.request);
-      setDetailSelectedFieldIds(requestFieldIds(response.request));
+      setDetailSelectedFieldIds(requestFieldIds(response.request).filter((fieldId) => !purchasedFieldIds.has(fieldId)));
       setDetailMorePrompt("");
     } catch (error) {
       setNotice(parseApiError(error));
@@ -1481,9 +1570,12 @@ export function AxiosApp() {
       const response = await extendSearchRequest(searchRequestDetail.id, { prompt: nextPrompt });
       const nextFieldIds = requestFieldIds(response.request);
       const nextAllowed = new Set(nextFieldIds);
+      const purchasedFieldIds = purchasedFieldIdsForQuote(searchRequestDetail.id);
       const addedFieldIds = nextFieldIds.filter((fieldId) => !previousFieldIds.has(fieldId));
       setSearchRequestDetail(response.request);
-      setDetailSelectedFieldIds((current) => Array.from(new Set([...current.filter((fieldId) => nextAllowed.has(fieldId)), ...addedFieldIds])));
+      setDetailSelectedFieldIds((current) =>
+        Array.from(new Set([...current.filter((fieldId) => nextAllowed.has(fieldId) && !purchasedFieldIds.has(fieldId)), ...addedFieldIds.filter((fieldId) => !purchasedFieldIds.has(fieldId))])),
+      );
       setDetailMorePrompt("");
       setNotice(addedFieldIds.length ? `${addedFieldIds.length} fields added` : "No new cards found");
       void refreshHistory(response.request.buyerWallet);
@@ -1506,21 +1598,23 @@ export function AxiosApp() {
     }
     setBusy(`request-checkout-${searchRequestDetail.id}`);
     try {
-      const licenseTokenGrants = await mintLicenseBatchForFields(selectedFieldCosts, buyerWallet);
+      validateServerLicenseMintFields(selectedFieldCosts, buyerWallet);
       const wantedFields = searchRequestDetail.wantedFields?.length ? searchRequestDetail.wantedFields : searchRequestDetail.recommendedFields;
-      const response = await createOrder({
+      const orderInput = {
         quoteId: searchRequestDetail.id,
         buyerWallet,
         prompt: searchRequestDetail.prompt,
         wantedFields,
         selectedFieldIds: selectedFieldCosts.map((fieldCost) => fieldCost.fieldId),
-        licenseTokenGrants,
-        paymentTxHash: licenseTokenGrants[0]?.mintTxHash,
-      });
+      };
+      const paymentTxHash = await payServerWalletForOrder(orderInput);
+      setNotice(`Issuing ${selectedFieldCosts.length} licenses on server`);
+      const response = await createOrder({ ...orderInput, paymentTxHash });
       const detailResponse = await getSearchRequest(searchRequestDetail.id);
       setSearchRequestDetail(detailResponse.request);
       const availableFieldIds = new Set(requestFieldIds(detailResponse.request));
-      setDetailSelectedFieldIds((current) => current.filter((fieldId) => availableFieldIds.has(fieldId)));
+      const purchasedFieldIds = new Set(response.order.selectedFieldIds);
+      setDetailSelectedFieldIds((current) => current.filter((fieldId) => availableFieldIds.has(fieldId) && !purchasedFieldIds.has(fieldId)));
       setNotice(`Checkout ${response.order.id} created`);
       await refreshHistory(buyerWallet);
     } catch (error) {
@@ -1567,6 +1661,22 @@ export function AxiosApp() {
     }
   }
 
+  async function viewOrderData(order: OrderSummary) {
+    if (!requireEmbeddedWallet("view CDR data")) return;
+    setBusy(`view-${order.id}`);
+    try {
+      const plan = await getExportPlan(order.id);
+      const walletConnection = await getEmbeddedWalletConnection();
+      const result = await buildRowsFromExportPlan(plan, walletConnection);
+      setAccessPreview(buildAccessPreview(order, plan, result));
+      setNotice(result.successfulFieldIds.length ? `${result.successfulFieldIds.length} fields opened` : "No fields opened");
+    } catch (error) {
+      setNotice(parseApiError(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function exportOrder(order: OrderSummary, format: "csv" | "xlsx") {
     if (!requireEmbeddedWallet("export CDR")) return;
     setBusy(`export-${order.id}`);
@@ -1574,6 +1684,7 @@ export function AxiosApp() {
       const plan = await getExportPlan(order.id);
       const walletConnection = await getEmbeddedWalletConnection();
       const result = await buildRowsFromExportPlan(plan, walletConnection);
+      setAccessPreview(buildAccessPreview(order, plan, result));
       if (format === "csv") downloadCsv(`${order.id}.csv`, result.rows);
       else downloadXlsx(`${order.id}.xlsx`, result.rows);
       await saveExportLog(order.id, {
@@ -1610,6 +1721,41 @@ export function AxiosApp() {
     } finally {
       setBusy(null);
     }
+  }
+
+  function renderOrderHistoryBlock(order: OrderSummary) {
+    const viewBusy = busy === `view-${order.id}`;
+    const exportBusy = busy === `export-${order.id}`;
+    return (
+      <div className="history-order-block" key={order.id}>
+        <article className="history-row">
+          <div>
+            <strong>{order.prompt}</strong>
+            <small>{formatFieldList(order.sheetParams.fields)} · {formatIpAmount(order.totalCents)}</small>
+            <small>{order.id}</small>
+          </div>
+          <div className="row-actions">
+            <button type="button" onClick={() => void reuseOrder(order)} disabled={busy === "search"}>
+              <RotateCcw size={15} />
+              Reuse
+            </button>
+            <button type="button" onClick={() => void viewOrderData(order)} disabled={viewBusy || exportBusy}>
+              {viewBusy ? <span className="button-spinner" aria-hidden="true" /> : <Eye size={15} />}
+              Data
+            </button>
+            <button type="button" onClick={() => void exportOrder(order, "csv")} disabled={viewBusy || exportBusy}>
+              {exportBusy ? <span className="button-spinner" aria-hidden="true" /> : <Download size={15} />}
+              CSV
+            </button>
+            <button type="button" onClick={() => void exportOrder(order, "xlsx")} disabled={viewBusy || exportBusy}>
+              <FileText size={15} />
+              XLSX
+            </button>
+          </div>
+        </article>
+        {accessPreview?.orderId === order.id ? <AccessDataPanel preview={accessPreview} onClose={() => setAccessPreview(null)} /> : null}
+      </div>
+    );
   }
 
   function toggleSelectedField(kind: DataFieldKind) {
@@ -2349,14 +2495,23 @@ export function AxiosApp() {
     if (searchRequestDetail) {
       const detailFields = searchRequestDetail.wantedFields ?? searchRequestDetail.recommendedFields;
       const detailFieldCosts = getRequestFieldCosts(searchRequestDetail);
-      const detailFieldIds = detailFieldCosts.map((fieldCost) => fieldCost.fieldId);
+      const detailOrders = orders.filter((order) => order.quoteId === searchRequestDetail.id);
+      const purchasedOrderByFieldId = new Map<string, OrderSummary>();
+      detailOrders.forEach((order) => {
+        order.selectedFieldIds.forEach((fieldId) => purchasedOrderByFieldId.set(fieldId, order));
+      });
+      const purchasedFieldIds = new Set(purchasedOrderByFieldId.keys());
+      const selectableDetailFieldCosts = detailFieldCosts.filter((fieldCost) => !purchasedFieldIds.has(fieldCost.fieldId));
+      const detailFieldIds = selectableDetailFieldCosts.map((fieldCost) => fieldCost.fieldId);
       const detailSelectedFieldSet = new Set(detailSelectedFieldIds);
-      const detailSelectedFieldCosts = detailFieldCosts.filter((fieldCost) => detailSelectedFieldSet.has(fieldCost.fieldId));
-      const detailAllFieldsSelected = detailFieldCosts.length > 0 && detailSelectedFieldCosts.length === detailFieldCosts.length;
-      const detailSelectedCards = countSelectedRequestCards(searchRequestDetail, detailSelectedFieldSet);
+      const detailSelectedFieldCosts = selectableDetailFieldCosts.filter((fieldCost) => detailSelectedFieldSet.has(fieldCost.fieldId));
+      const detailAllFieldsSelected = selectableDetailFieldCosts.length > 0 && detailSelectedFieldCosts.length === selectableDetailFieldCosts.length;
+      const detailCheckoutFieldSet = new Set(detailSelectedFieldCosts.map((fieldCost) => fieldCost.fieldId));
+      const detailSelectedCards = countSelectedRequestCards(searchRequestDetail, detailCheckoutFieldSet);
       const detailSelectedTotal = calculateFieldCostTotal(detailSelectedFieldCosts);
       const checkoutBusy = busy === `request-checkout-${searchRequestDetail.id}`;
       const extendBusy = busy === `request-extend-${searchRequestDetail.id}`;
+      const openedFieldValues = accessPreview?.fieldValues ?? {};
       return (
         <div className="list-screen request-detail-screen">
           <div className="screen-title">
@@ -2412,7 +2567,7 @@ export function AxiosApp() {
                   <h2>Search results</h2>
                   <button
                     type="button"
-                    disabled={!detailFieldCosts.length}
+                    disabled={!selectableDetailFieldCosts.length}
                     onClick={() => setDetailSelectedFieldIds(detailAllFieldsSelected ? [] : detailFieldIds)}
                   >
                     {detailAllFieldsSelected ? "Clear" : "All"}
@@ -2422,32 +2577,63 @@ export function AxiosApp() {
                   <div className="request-result-list">
                     {searchRequestDetail.matches.map((match) => {
                       const matchFieldIds = match.fieldCosts.map((fieldCost) => fieldCost.fieldId);
-                      const matchAllSelected = matchFieldIds.length > 0 && matchFieldIds.every((fieldId) => detailSelectedFieldSet.has(fieldId));
-                      const matchSelectedCount = matchFieldIds.filter((fieldId) => detailSelectedFieldSet.has(fieldId)).length;
+                      const matchSelectableFieldIds = matchFieldIds.filter((fieldId) => !purchasedFieldIds.has(fieldId));
+                      const matchPurchasedCount = matchFieldIds.length - matchSelectableFieldIds.length;
+                      const matchAllSelected = matchSelectableFieldIds.length > 0 && matchSelectableFieldIds.every((fieldId) => detailSelectedFieldSet.has(fieldId));
+                      const matchSelectedCount = matchSelectableFieldIds.filter((fieldId) => detailSelectedFieldSet.has(fieldId)).length;
                       return (
                         <article className="request-result-row" key={match.matchRef}>
                           <div className="request-result-head">
-                            <label className="request-match-toggle">
-                              <input
-                                aria-label={`Select ${match.matchRef}`}
-                                checked={matchAllSelected}
-                                disabled={!match.fieldCosts.length}
-                                type="checkbox"
-                                onChange={() => toggleDetailMatch(match)}
-                              />
-                              <span>
-                                <strong>{match.matchRef}</strong>
-                                <small>{match.signals.length ? match.signals.join(" · ") : "Anonymous card"}</small>
-                              </span>
-                            </label>
+                            {matchSelectableFieldIds.length ? (
+                              <label className="request-match-toggle">
+                                <input
+                                  aria-label={`Select ${match.matchRef}`}
+                                  checked={matchAllSelected}
+                                  disabled={!matchSelectableFieldIds.length}
+                                  type="checkbox"
+                                  onChange={() => toggleDetailMatch(match)}
+                                />
+                                <span>
+                                  <strong>{match.matchRef}</strong>
+                                  <small>{match.signals.length ? match.signals.join(" · ") : "Anonymous card"}</small>
+                                </span>
+                              </label>
+                            ) : (
+                              <div className="request-match-toggle request-match-paid">
+                                <IconAsset name="ip" size={22} />
+                                <span>
+                                  <strong>{match.matchRef}</strong>
+                                  <small>{match.signals.length ? match.signals.join(" · ") : "Anonymous card"}</small>
+                                </span>
+                              </div>
+                            )}
                             <span className="request-result-count">
-                              {matchSelectedCount}/{matchFieldIds.length}
+                              {matchPurchasedCount ? `${matchPurchasedCount}/${matchFieldIds.length} paid` : `${matchSelectedCount}/${matchSelectableFieldIds.length}`}
                             </span>
                             <strong className="request-result-total">{formatIpAmount(calculateRequestMatchSubtotal(match))}</strong>
                           </div>
                           {match.fieldCosts.length ? (
                             <div className="request-field-options">
                               {match.fieldCosts.map((fieldCost) => {
+                                const purchasedOrder = purchasedOrderByFieldId.get(fieldCost.fieldId);
+                                const openedValue = openedFieldValues[fieldCost.fieldId];
+                                if (purchasedOrder) {
+                                  return (
+                                    <div className={openedValue ? "request-field-option purchased opened" : "request-field-option purchased"} key={fieldCost.fieldId}>
+                                      <span className="checkout-field-slot">LV1</span>
+                                      <span className="request-field-name">{fieldCost.label}</span>
+                                      <span className="request-field-value">{openedValue || "Purchased"}</span>
+                                      <button
+                                        type="button"
+                                        onClick={() => void viewOrderData(purchasedOrder)}
+                                        disabled={busy === `view-${purchasedOrder.id}`}
+                                      >
+                                        {busy === `view-${purchasedOrder.id}` ? <span className="button-spinner" aria-hidden="true" /> : <Eye size={15} />}
+                                        Data
+                                      </button>
+                                    </div>
+                                  );
+                                }
                                 const fieldSelected = detailSelectedFieldSet.has(fieldCost.fieldId);
                                 return (
                                   <label className={fieldSelected ? "request-field-option selected" : "request-field-option"} key={fieldCost.fieldId}>
@@ -2479,7 +2665,7 @@ export function AxiosApp() {
 
             <aside className="request-checkout-card" aria-label="Request checkout">
               <strong>Checkout</strong>
-              <small>Only selected request fields will be minted and ordered.</small>
+              <small>Only unpaid request fields will be minted and ordered.</small>
               <dl>
                 <div>
                   <dt>Fields</dt>
@@ -2559,29 +2745,7 @@ export function AxiosApp() {
         {orders.length ? (
           <section className="history-section" aria-label="Batch requests">
             <h2>Batch requests</h2>
-            {orders.map((order) => (
-              <article className="history-row" key={order.id}>
-                <div>
-                  <strong>{order.prompt}</strong>
-                  <small>{formatFieldList(order.sheetParams.fields)} · {formatIpAmount(order.totalCents)}</small>
-                  <small>{order.id}</small>
-                </div>
-                <div className="row-actions">
-                  <button type="button" onClick={() => reuseOrder(order)}>
-                    <RotateCcw size={15} />
-                    Reuse
-                  </button>
-                  <button type="button" onClick={() => exportOrder(order, "csv")}>
-                    <Download size={15} />
-                    CSV
-                  </button>
-                  <button type="button" onClick={() => exportOrder(order, "xlsx")}>
-                    <FileText size={15} />
-                    XLSX
-                  </button>
-                </div>
-              </article>
-            ))}
+            {orders.map((order) => renderOrderHistoryBlock(order))}
           </section>
         ) : null}
 
@@ -2591,7 +2755,6 @@ export function AxiosApp() {
       </div>
     );
   }
-
   function renderSales() {
     return (
       <div className="list-screen">
@@ -2629,7 +2792,7 @@ export function AxiosApp() {
             </article>
           ))
         ) : (
-          <EmptyState icon={<IconAsset name="ip" size={30} />} title="No on-chain sales logs yet" />
+          <EmptyState icon={<IconAsset name="ip" size={30} />} title="No field sales logs yet" />
         )}
       </div>
     );
@@ -2990,6 +3153,51 @@ function DataInputRow(props: {
       </label>
       {props.action ? <div className="data-action-cell">{props.action}</div> : null}
     </div>
+  );
+}
+
+function AccessDataPanel(props: { preview: AccessPreviewState; onClose(): void }) {
+  return (
+    <section className="access-data-panel" aria-label="Accessed data">
+      <div className="access-data-head">
+        <div>
+          <strong>Accessed data</strong>
+          <small>
+            {props.preview.successfulFieldIds.length} opened
+            {props.preview.failedFieldIds.length ? ` · ${props.preview.failedFieldIds.length} failed` : ""} ·{" "}
+            {new Date(props.preview.generatedAt).toLocaleString()}
+          </small>
+        </div>
+        <button type="button" aria-label="Close accessed data" onClick={props.onClose}>
+          <X size={16} />
+        </button>
+      </div>
+
+      {props.preview.rows.length ? (
+        <div className="access-data-table-wrap">
+          <table className="access-data-table">
+            <thead>
+              <tr>
+                {props.preview.columns.map((column) => (
+                  <th key={column}>{formatAccessColumnLabel(column)}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {props.preview.rows.map((row) => (
+                <tr key={row.profileRef}>
+                  {props.preview.columns.map((column) => (
+                    <td key={column}>{row[column] ?? ""}</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <p className="access-data-empty">No fields opened for this order.</p>
+      )}
+    </section>
   );
 }
 

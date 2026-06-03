@@ -77,6 +77,29 @@ export function createOrder(input: {
   });
 }
 
+export function getOrderPaymentIntent(input: {
+  quoteId?: string;
+  buyerWallet: string;
+  prompt: string;
+  wantedFields: DataFieldKind[];
+  selectedMatchRefs?: string[];
+  selectedFieldIds?: string[];
+}) {
+  return apiRequest<{
+    payment: {
+      recipientWallet: string;
+      amountCents: number;
+      amountWei: string;
+      currency: "IP";
+      selectedFieldIds: string[];
+      fieldCount: number;
+    };
+  }>("/orders/payment-intent", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
 export function listOrders(buyerWallet: string) {
   return apiRequest<{ orders: OrderSummary[] }>(`/orders?buyerWallet=${encodeURIComponent(buyerWallet)}`);
 }

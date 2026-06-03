@@ -4,9 +4,9 @@ import {
   STORY_AENEID_CHAIN,
   STORY_AENEID_LICENSE_TOKEN_ADDRESS,
   STORY_AENEID_LICENSING_MODULE_ADDRESS,
-  STORY_AENEID_MULTICALL3_ADDRESS,
   STORY_AENEID_PILICENSE_TEMPLATE_ADDRESS,
   STORY_AENEID_RPC_URL,
+  STORY_AENEID_ROYALTY_MODULE_ADDRESS,
   STORY_AENEID_WIP_TOKEN_ADDRESS,
 } from "./network";
 import type { PrivyWalletConnection } from "./privy";
@@ -75,17 +75,6 @@ const erc20Abi = [
     ],
     outputs: [{ name: "ok", type: "bool" }],
   },
-  {
-    type: "function",
-    name: "transferFrom",
-    stateMutability: "nonpayable",
-    inputs: [
-      { name: "from", type: "address" },
-      { name: "to", type: "address" },
-      { name: "value", type: "uint256" },
-    ],
-    outputs: [{ name: "ok", type: "bool" }],
-  },
 ] as const;
 
 const wipTokenAbi = [
@@ -107,35 +96,6 @@ const licenseTokenAbi = [
       { name: "from", type: "address", indexed: true },
       { name: "to", type: "address", indexed: true },
       { name: "tokenId", type: "uint256", indexed: true },
-    ],
-  },
-] as const;
-
-const multicall3Abi = [
-  {
-    type: "function",
-    name: "aggregate3",
-    stateMutability: "nonpayable",
-    inputs: [
-      {
-        name: "calls",
-        type: "tuple[]",
-        components: [
-          { name: "target", type: "address" },
-          { name: "allowFailure", type: "bool" },
-          { name: "callData", type: "bytes" },
-        ],
-      },
-    ],
-    outputs: [
-      {
-        name: "returnData",
-        type: "tuple[]",
-        components: [
-          { name: "success", type: "bool" },
-          { name: "returnData", type: "bytes" },
-        ],
-      },
     ],
   },
 ] as const;
@@ -328,7 +288,7 @@ async function ensureMintFeePrepared(
 ) {
   const normalizedCurrency = currencyToken.toLowerCase();
   const normalizedWip = STORY_AENEID_WIP_TOKEN_ADDRESS.toLowerCase();
-  const spender = STORY_AENEID_LICENSING_MODULE_ADDRESS;
+  const spender = STORY_AENEID_ROYALTY_MODULE_ADDRESS;
 
   mintDebug("fee_prepare_start", {
     currencyToken,
@@ -341,7 +301,9 @@ async function ensureMintFeePrepared(
   let balance = await readErc20Balance(publicClient, currencyToken, wallet.account);
   mintDebug("fee_balance_check", { currencyToken, tokenAmount, balance });
 
-  if (balance < tokenAmount) {
+  if (balance >= tokenAmount) {
+    mintDebug("fee_balance_sufficient", { currencyToken, tokenAmount, balance });
+  } else {
     if (normalizedCurrency !== normalizedWip) {
       mintError("fee_balance_insufficient", new Error("license_fee_balance_insufficient"), {
         currencyToken,
@@ -460,110 +422,93 @@ export async function mintStoryLicenseTokensBatch(wallet: PrivyWalletConnection,
     await ensureMintFeePrepared(wallet, publicClient, currencyToken, tokenAmount);
   }
 
-  const calls: Array<{ target: `0x${string}`; allowFailure: false; callData: `0x${string}` }> = [];
+  const grants: Array<{ fieldId: string; licenseTokenId: string; mintTxHash: `0x${string}` }> = [];
   for (const [index, input] of inputs.entries()) {
     const predictedFee = predictedFees[index];
-    calls.push({
-      target: STORY_AENEID_LICENSING_MODULE_ADDRESS,
-      allowFailure: false,
-      callData: viem.encodeFunctionData({
+    const args = [
+      input.licensorIpId,
+      STORY_AENEID_PILICENSE_TEMPLATE_ADDRESS,
+      BigInt(input.licenseTermsId),
+      amount,
+      input.receiver,
+      royaltyContext,
+      predictedFee?.tokenAmount ?? 0n,
+      MAX_REVENUE_SHARE,
+    ] as const;
+
+    mintDebug("direct_mint_submit", {
+      index,
+      fieldId: input.fieldId,
+      licensorIpId: input.licensorIpId,
+      licenseTermsId: input.licenseTermsId,
+      receiver: input.receiver,
+      maxMintingFee: predictedFee?.tokenAmount ?? 0n,
+    });
+    let txHash: `0x${string}`;
+    try {
+      txHash = await wallet.walletClient.writeContract({
+        account: wallet.account,
+        chain: STORY_AENEID_CHAIN,
+        address: STORY_AENEID_LICENSING_MODULE_ADDRESS,
         abi: licensingModuleAbi,
         functionName: "mintLicenseTokens",
-        args: [
-          input.licensorIpId,
-          STORY_AENEID_PILICENSE_TEMPLATE_ADDRESS,
-          BigInt(input.licenseTermsId),
-          amount,
-          input.receiver,
-          royaltyContext,
-          predictedFee?.tokenAmount ?? 0n,
-          MAX_REVENUE_SHARE,
-        ],
-      }),
-    });
-  }
-
-  const callSummary = calls.map((call, index) => ({
-    index,
-    target: call.target,
-    callDataPrefix: call.callData.slice(0, 10),
-    callDataLength: call.callData.length,
-  }));
-  mintDebug("multicall_submit", {
-    multicallAddress: STORY_AENEID_MULTICALL3_ADDRESS,
-    callCount: calls.length,
-    mintCallCount: inputs.length,
-    callSummary,
-  });
-  let txHash: `0x${string}`;
-  try {
-    txHash = await wallet.walletClient.writeContract({
-      account: wallet.account,
-      chain: STORY_AENEID_CHAIN,
-      address: STORY_AENEID_MULTICALL3_ADDRESS,
-      abi: multicall3Abi,
-      functionName: "aggregate3",
-      args: [calls],
-    } as never) as `0x${string}`;
-  } catch (error) {
-    mintError("multicall_submit_failed", error, {
-      multicallAddress: STORY_AENEID_MULTICALL3_ADDRESS,
-      callCount: calls.length,
-      mintCallCount: inputs.length,
-      callSummary,
-    });
-    throw error;
-  }
-  mintDebug("multicall_submitted", { txHash, callCount: calls.length });
-  const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash as `0x${string}` });
-  mintDebug("multicall_receipt", {
-    txHash,
-    status: receipt.status,
-    blockNumber: receipt.blockNumber,
-    gasUsed: receipt.gasUsed,
-    logCount: receipt.logs.length,
-  });
-  if (receipt.status !== "success") {
-    mintError("multicall_receipt_failed", new Error("license_multicall_mint_failed"), { txHash, status: receipt.status });
-    throw new Error("license_multicall_mint_failed");
-  }
-
-  const tokenIds: string[] = [];
-  for (const log of receipt.logs) {
-    if (log.address.toLowerCase() !== STORY_AENEID_LICENSE_TOKEN_ADDRESS.toLowerCase()) continue;
-    try {
-      const decoded = viem.decodeEventLog({
-        abi: licenseTokenAbi,
-        eventName: "Transfer",
-        data: log.data,
-        topics: log.topics,
-      });
-      if (
-        decoded.args.from.toLowerCase() === viem.zeroAddress &&
-        decoded.args.to.toLowerCase() === wallet.account.toLowerCase()
-      ) {
-        tokenIds.push(decoded.args.tokenId.toString());
-      }
-    } catch {
-      // Ignore non-Transfer logs from the LicenseToken contract.
+        args,
+      } as never) as `0x${string}`;
+    } catch (error) {
+      mintError("direct_mint_submit_failed", error, { index, fieldId: input.fieldId });
+      throw error;
     }
+
+    mintDebug("direct_mint_submitted", { index, fieldId: input.fieldId, txHash });
+    const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
+    mintDebug("direct_mint_receipt", {
+      index,
+      fieldId: input.fieldId,
+      txHash,
+      status: receipt.status,
+      blockNumber: receipt.blockNumber,
+      gasUsed: receipt.gasUsed,
+      logCount: receipt.logs.length,
+    });
+    if (receipt.status !== "success") {
+      mintError("direct_mint_receipt_failed", new Error("license_token_mint_failed"), { index, fieldId: input.fieldId, txHash, status: receipt.status });
+      throw new Error("license_token_mint_failed");
+    }
+
+    const tokenIds: string[] = [];
+    for (const log of receipt.logs) {
+      if (log.address.toLowerCase() !== STORY_AENEID_LICENSE_TOKEN_ADDRESS.toLowerCase()) continue;
+      try {
+        const decoded = viem.decodeEventLog({
+          abi: licenseTokenAbi,
+          eventName: "Transfer",
+          data: log.data,
+          topics: log.topics,
+        });
+        if (
+          decoded.args.from.toLowerCase() === viem.zeroAddress &&
+          decoded.args.to.toLowerCase() === input.receiver.toLowerCase()
+        ) {
+          tokenIds.push(decoded.args.tokenId.toString());
+        }
+      } catch {
+        // Ignore non-Transfer logs from the LicenseToken contract.
+      }
+    }
+
+    mintDebug("direct_mint_license_transfer_events", { index, fieldId: input.fieldId, txHash, expectedCount: 1, tokenIds });
+    if (tokenIds.length !== 1) {
+      mintError("license_event_count_mismatch", new Error("license_token_mint_event_missing"), { index, fieldId: input.fieldId, txHash, tokenIds });
+      throw new Error("license_token_mint_event_missing");
+    }
+    grants.push({
+      fieldId: input.fieldId,
+      licenseTokenId: tokenIds[0]!,
+      mintTxHash: txHash,
+    });
   }
 
-  mintDebug("license_transfer_events", { txHash, expectedCount: inputs.length, tokenIds });
-  if (tokenIds.length !== inputs.length) {
-    mintError("license_event_count_mismatch", new Error("license_batch_mint_event_missing"), { txHash, expectedCount: inputs.length, tokenIds });
-    throw new Error("license_batch_mint_event_missing");
-  }
-  const grants = inputs.map((input, index) => {
-    const licenseTokenId = tokenIds[index];
-    if (!licenseTokenId) throw new Error("license_batch_mint_event_missing");
-    return {
-      fieldId: input.fieldId,
-      licenseTokenId,
-      mintTxHash: txHash as `0x${string}`,
-    };
-  });
-  mintDebug("batch_success", { txHash, grants });
+  mintDebug("batch_success", { mintMode: "direct", grantCount: grants.length, grants });
   return grants;
 }
 
@@ -588,7 +533,7 @@ export async function mintStoryLicenseToken(wallet: PrivyWalletConnection, input
   } as never) as readonly [`0x${string}`, bigint];
   if (tokenAmount > 0n) {
     if (currencyToken.toLowerCase() === viem.zeroAddress) throw new Error("license_fee_currency_missing");
-    await ensureErc20Allowance(wallet, publicClient, currencyToken, STORY_AENEID_LICENSING_MODULE_ADDRESS, tokenAmount);
+    await ensureMintFeePrepared(wallet, publicClient, currencyToken, tokenAmount);
   }
   const args = [
     input.licensorIpId,
