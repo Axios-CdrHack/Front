@@ -1,6 +1,6 @@
 import { notFound } from "next/navigation";
 import Link from "next/link";
-import { Mail, MessageCircle, Phone, WalletCards } from "lucide-react";
+import { Droplet, Mail, MessageCircle, Phone, Ruler, Scale, ShieldCheck, WalletCards } from "lucide-react";
 import { getPublicCard } from "../../../lib/api";
 import { IconAsset } from "../../../components/sys/cell/IconAsset";
 import type { PublicCardDataField } from "../../../lib/types";
@@ -14,6 +14,10 @@ function publicCardFieldLabel(field: PublicCardDataField) {
   if (field.kind === "telegram") return "Telegram";
   if (field.kind === "discord") return "Discord";
   if (field.kind === "twitter") return "Twitter";
+  if (field.kind === "insurance") return "Insurance Data";
+  if (field.kind === "height") return "Height";
+  if (field.kind === "weight") return "Weight";
+  if (field.kind === "blood_type") return "Blood Type";
   return field.label;
 }
 
@@ -21,6 +25,10 @@ function publicCardFieldIcon(field: PublicCardDataField) {
   if (field.kind === "email") return <Mail size={14} />;
   if (field.kind === "mobile") return <Phone size={14} />;
   if (field.kind === "telegram" || field.kind === "discord" || field.kind === "twitter") return <MessageCircle size={14} />;
+  if (field.kind === "insurance") return <ShieldCheck size={14} />;
+  if (field.kind === "height") return <Ruler size={14} />;
+  if (field.kind === "weight") return <Scale size={14} />;
+  if (field.kind === "blood_type") return <Droplet size={14} />;
   return <WalletCards size={14} />;
 }
 

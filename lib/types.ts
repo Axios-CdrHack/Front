@@ -15,7 +15,7 @@ export type PublicFieldKind =
   | "careerStatus"
   | "careers";
 
-export type DataFieldKind = "email" | "mobile" | "telegram" | "discord" | "twitter";
+export type DataFieldKind = "email" | "mobile" | "telegram" | "discord" | "twitter" | "insurance" | "height" | "weight" | "blood_type";
 
 export type AccessMode = "free" | "paid";
 
@@ -254,9 +254,17 @@ export interface SearchRequestSummary {
   createdAt: string;
 }
 
+export interface SearchRequestExtension {
+  prompt: string;
+  filters: QuoteFilters;
+  addedProfileIds: string[];
+  createdAt: string;
+}
+
 export interface SearchRequestDetail extends SearchRequestSummary {
   profileIds: string[];
   matches: QuoteResponse["matches"];
+  extensions: SearchRequestExtension[];
   batchSize: number;
   capped: boolean;
   maxPaidFields: number;

@@ -30,6 +30,7 @@ import {
   confirmVerification,
   createOrder,
   deployCdrWithServerWalletEvents,
+  extendSearchRequest,
   getExportPlan,
   getMyProfile,
   getQuote,
@@ -62,7 +63,7 @@ import type {
 } from "../lib/types";
 
 type NavKey = "search" | "myData" | "requests" | "sales" | "settings";
-type MyDataFilterKey = "basic" | "depth1";
+type MyDataFilterKey = "basic" | "lv1" | "lv2";
 
 type FieldDraft = {
   id?: string;
@@ -123,6 +124,7 @@ type ConfirmDialogState = {
 };
 
 type QuoteMatch = QuoteResponse["matches"][number];
+type QuoteFieldCost = QuoteMatch["fieldCosts"][number];
 type SearchWorkflowState = {
   prompt: string;
   progress: number;
@@ -142,15 +144,20 @@ const navItems: Array<{ key: NavKey; label: string; icon: IconAssetName }> = [
   { key: "settings", label: "Settings", icon: "setting" },
 ] as const;
 
-const paidFieldDefs: Array<Pick<FieldDraft, "kind" | "label" | "valuePreview" | "priceCents" | "requiresVerification"> & { level: "LV1" }> = [
+const paidFieldDefs: Array<Pick<FieldDraft, "kind" | "label" | "valuePreview" | "priceCents" | "requiresVerification"> & { level: "LV1" | "LV2" }> = [
   { kind: "email", label: "E-mail", valuePreview: "", priceCents: 900, requiresVerification: false, level: "LV1" },
   { kind: "mobile", label: "Mobile", valuePreview: "", priceCents: 1400, requiresVerification: true, level: "LV1" },
   { kind: "telegram", label: "Telegram", valuePreview: "", priceCents: 450, requiresVerification: false, level: "LV1" },
   { kind: "discord", label: "Discord", valuePreview: "", priceCents: 350, requiresVerification: false, level: "LV1" },
   { kind: "twitter", label: "Twitter", valuePreview: "", priceCents: 300, requiresVerification: false, level: "LV1" },
+  { kind: "insurance", label: "Insurance Data", valuePreview: "", priceCents: 2200, requiresVerification: false, level: "LV2" },
+  { kind: "height", label: "Height", valuePreview: "", priceCents: 250, requiresVerification: false, level: "LV2" },
+  { kind: "weight", label: "Weight", valuePreview: "", priceCents: 250, requiresVerification: false, level: "LV2" },
+  { kind: "blood_type", label: "Blood Type", valuePreview: "", priceCents: 300, requiresVerification: false, level: "LV2" },
 ];
 
 const socialHandleFieldKinds = new Set<DataFieldKind>(["telegram", "discord", "twitter"]);
+const fieldLevelByKind = new Map<DataFieldKind, "LV1" | "LV2">(paidFieldDefs.map((field) => [field.kind, field.level]));
 
 const freeDataTip = "무료 데이터에 정확히 적어줘야 데이터가 세일즈 될 확률이 높아요.";
 const genderOptions = [
@@ -489,6 +496,18 @@ function calculateRequestMatchSubtotal(match: QuoteMatch) {
   return match.fieldCosts.reduce((total, fieldCost) => total + fieldCost.priceCents, 0);
 }
 
+function getRequestFieldCosts(request: SearchRequestDetail) {
+  return request.matches.flatMap((match) => match.fieldCosts);
+}
+
+function calculateFieldCostTotal(fieldCosts: QuoteFieldCost[]) {
+  return fieldCosts.reduce((total, fieldCost) => total + fieldCost.priceCents, 0);
+}
+
+function countSelectedRequestCards(request: SearchRequestDetail, selectedFieldIds: Set<string>) {
+  return request.matches.filter((match) => match.fieldCosts.some((fieldCost) => selectedFieldIds.has(fieldCost.fieldId))).length;
+}
+
 function calculateFieldSubtotal(matches: QuoteMatch[], kind: DataFieldKind) {
   return matches.reduce((total, match) => {
     const fieldCost = match.fieldCosts.find((item) => item.kind === kind);
@@ -537,6 +556,8 @@ export function AxiosApp() {
   const [selectedMatches, setSelectedMatches] = useState<string[]>([]);
   const [searchRequests, setSearchRequests] = useState<SearchRequestSummary[]>([]);
   const [searchRequestDetail, setSearchRequestDetail] = useState<SearchRequestDetail | null>(null);
+  const [detailSelectedFieldIds, setDetailSelectedFieldIds] = useState<string[]>([]);
+  const [detailMorePrompt, setDetailMorePrompt] = useState("");
   const [orders, setOrders] = useState<OrderSummary[]>([]);
   const [sales, setSales] = useState<SaleSummary[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
@@ -1338,6 +1359,8 @@ export function AxiosApp() {
     if (!wallet) {
       setSearchRequests([]);
       setSearchRequestDetail(null);
+      setDetailSelectedFieldIds([]);
+      setDetailMorePrompt("");
       setOrders([]);
       setSales([]);
       return;
@@ -1354,11 +1377,121 @@ export function AxiosApp() {
     }
   }
 
+  function requestFieldIds(request: SearchRequestDetail) {
+    return getRequestFieldCosts(request).map((fieldCost) => fieldCost.fieldId);
+  }
+
+  function closeSearchRequestDetail() {
+    setSearchRequestDetail(null);
+    setDetailSelectedFieldIds([]);
+    setDetailMorePrompt("");
+  }
+
+  function toggleDetailField(fieldId: string) {
+    setDetailSelectedFieldIds((current) => (current.includes(fieldId) ? current.filter((id) => id !== fieldId) : [...current, fieldId]));
+  }
+
+  function toggleDetailMatch(match: QuoteMatch) {
+    const matchFieldIds = match.fieldCosts.map((fieldCost) => fieldCost.fieldId);
+    const matchFieldSet = new Set(matchFieldIds);
+    setDetailSelectedFieldIds((current) => {
+      const allSelected = matchFieldIds.every((fieldId) => current.includes(fieldId));
+      if (allSelected) return current.filter((fieldId) => !matchFieldSet.has(fieldId));
+      return Array.from(new Set([...current, ...matchFieldIds]));
+    });
+  }
+
   async function openSearchRequestDetail(request: SearchRequestSummary) {
     setBusy(`request-${request.id}`);
     try {
       const response = await getSearchRequest(request.id);
       setSearchRequestDetail(response.request);
+      setDetailSelectedFieldIds(requestFieldIds(response.request));
+      setDetailMorePrompt("");
+    } catch (error) {
+      setNotice(parseApiError(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleExtendSearchRequest() {
+    if (!searchRequestDetail) return;
+    const nextPrompt = detailMorePrompt.trim();
+    if (!nextPrompt) {
+      setNotice("Enter a search prompt");
+      return;
+    }
+    setBusy(`request-extend-${searchRequestDetail.id}`);
+    try {
+      const previousFieldIds = new Set(requestFieldIds(searchRequestDetail));
+      const response = await extendSearchRequest(searchRequestDetail.id, { prompt: nextPrompt });
+      const nextFieldIds = requestFieldIds(response.request);
+      const nextAllowed = new Set(nextFieldIds);
+      const addedFieldIds = nextFieldIds.filter((fieldId) => !previousFieldIds.has(fieldId));
+      setSearchRequestDetail(response.request);
+      setDetailSelectedFieldIds((current) => Array.from(new Set([...current.filter((fieldId) => nextAllowed.has(fieldId)), ...addedFieldIds])));
+      setDetailMorePrompt("");
+      setNotice(addedFieldIds.length ? `${addedFieldIds.length} fields added` : "No new cards found");
+      void refreshHistory(response.request.buyerWallet);
+    } catch (error) {
+      setNotice(parseApiError(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleCheckoutSearchRequestDetail() {
+    if (!searchRequestDetail) return;
+    const buyerWallet = requireEmbeddedWallet("checkout request");
+    if (!buyerWallet) return;
+    const selectedFieldIdSet = new Set(detailSelectedFieldIds);
+    const selectedFieldCosts = getRequestFieldCosts(searchRequestDetail).filter((fieldCost) => selectedFieldIdSet.has(fieldCost.fieldId));
+    if (!selectedFieldCosts.length) {
+      setNotice("Select at least one field");
+      return;
+    }
+    setBusy(`request-checkout-${searchRequestDetail.id}`);
+    try {
+      const walletConnection = await getEmbeddedWalletConnection();
+      const { mintStoryLicenseToken } = await import("../lib/web3/license");
+      const licenseTokenGrants = [];
+      for (const field of selectedFieldCosts) {
+        if (
+          !isAddress(field.cdrLicenseIpId) ||
+          !isUintString(field.cdrLicenseTermsId) ||
+          !isAddress(field.ipaNftContract) ||
+          !isUintString(field.ipaTokenId) ||
+          !isTxHash(field.licenseConfigTxHash)
+        ) {
+          throw new Error("field_license_config_missing");
+        }
+        setNotice(`Minting ${field.label} license`);
+        licenseTokenGrants.push(
+          await mintStoryLicenseToken(walletConnection, {
+            fieldId: field.fieldId,
+            licensorIpId: field.cdrLicenseIpId,
+            licenseTermsId: field.cdrLicenseTermsId,
+            receiver: buyerWallet as `0x${string}`,
+          }),
+        );
+      }
+      const wantedFields = searchRequestDetail.wantedFields?.length ? searchRequestDetail.wantedFields : searchRequestDetail.recommendedFields;
+      const response = await createOrder({
+        quoteId: searchRequestDetail.id,
+        buyerWallet,
+        prompt: searchRequestDetail.prompt,
+        wantedFields,
+        selectedFieldIds: selectedFieldCosts.map((fieldCost) => fieldCost.fieldId),
+        licenseTokenGrants,
+        paymentTxHash: licenseTokenGrants[0]?.mintTxHash,
+      });
+      const detailResponse = await getSearchRequest(searchRequestDetail.id);
+      setSearchRequestDetail(detailResponse.request);
+      const availableFieldIds = new Set(requestFieldIds(detailResponse.request));
+      setDetailSelectedFieldIds((current) => current.filter((fieldId) => availableFieldIds.has(fieldId)));
+      setNotice(`Checkout ${response.order.id} created`);
+      await refreshHistory(buyerWallet);
     } catch (error) {
       setNotice(parseApiError(error));
     } finally {
@@ -1836,7 +1969,9 @@ export function AxiosApp() {
     const canVerifyData = appAuthReady;
     const canRunCdrAction = Boolean(appAuthReady && connectedWallet);
     const showBasicInfo = activeMyDataFilter === "basic";
-    const showDepthInfo = activeMyDataFilter === "depth1";
+    const showLv1Info = activeMyDataFilter === "lv1";
+    const showLv2Info = activeMyDataFilter === "lv2";
+    const visibleDataFields = fields.filter((field) => fieldLevelByKind.get(field.kind) === (showLv1Info ? "LV1" : "LV2"));
     const profileRows: PublicProfileRow[] = [
       { key: "name", label: "Name", required: true, value: profile.publicFields.name },
       { key: "gender", label: "Gender", control: "radio", options: genderOptions, required: true, value: profile.publicFields.gender },
@@ -1904,13 +2039,22 @@ export function AxiosApp() {
                   Basic Data
                 </button>
                 <button
-                  className={showDepthInfo ? "data-type-button active" : "data-type-button"}
+                  className={showLv1Info ? "data-type-button active" : "data-type-button"}
                   type="button"
                   role="tab"
-                  aria-selected={showDepthInfo}
-                  onClick={() => setActiveMyDataFilter("depth1")}
+                  aria-selected={showLv1Info}
+                  onClick={() => setActiveMyDataFilter("lv1")}
                 >
                   LV1 Data
+                </button>
+                <button
+                  className={showLv2Info ? "data-type-button active" : "data-type-button"}
+                  type="button"
+                  role="tab"
+                  aria-selected={showLv2Info}
+                  onClick={() => setActiveMyDataFilter("lv2")}
+                >
+                  LV2 Data
                 </button>
               </div>
             </div>
@@ -2048,8 +2192,8 @@ export function AxiosApp() {
               </>
             ) : null}
 
-            {showDepthInfo
-              ? fields.map((field) => {
+            {showLv1Info || showLv2Info
+              ? visibleDataFields.map((field) => {
                   const needsVerification = field.requiresVerification && field.verificationStatus !== "verified";
                   const isTimer = needsVerification && Boolean(field.verificationId);
                   const issuedMark = <IssuedFieldMark ipId={field.cdrLicenseIpId} onCopy={() => setNotice("IPA copied")} onCopyError={() => setNotice("Copy failed")} />;
@@ -2167,11 +2311,20 @@ export function AxiosApp() {
   function renderRequests() {
     if (searchRequestDetail) {
       const detailFields = searchRequestDetail.wantedFields ?? searchRequestDetail.recommendedFields;
+      const detailFieldCosts = getRequestFieldCosts(searchRequestDetail);
+      const detailFieldIds = detailFieldCosts.map((fieldCost) => fieldCost.fieldId);
+      const detailSelectedFieldSet = new Set(detailSelectedFieldIds);
+      const detailSelectedFieldCosts = detailFieldCosts.filter((fieldCost) => detailSelectedFieldSet.has(fieldCost.fieldId));
+      const detailAllFieldsSelected = detailFieldCosts.length > 0 && detailSelectedFieldCosts.length === detailFieldCosts.length;
+      const detailSelectedCards = countSelectedRequestCards(searchRequestDetail, detailSelectedFieldSet);
+      const detailSelectedTotal = calculateFieldCostTotal(detailSelectedFieldCosts);
+      const checkoutBusy = busy === `request-checkout-${searchRequestDetail.id}`;
+      const extendBusy = busy === `request-extend-${searchRequestDetail.id}`;
       return (
         <div className="list-screen request-detail-screen">
           <div className="screen-title">
             <div className="screen-title-left">
-              <button className="refresh-button" type="button" aria-label="Back to requests" onClick={() => setSearchRequestDetail(null)}>
+              <button className="refresh-button" type="button" aria-label="Back to requests" onClick={closeSearchRequestDetail}>
                 <ArrowLeft size={18} />
               </button>
               <h1>Request</h1>
@@ -2182,41 +2335,135 @@ export function AxiosApp() {
             </button>
           </div>
 
-          <section className="request-detail-card" aria-label="Request detail">
-            <strong>{searchRequestDetail.prompt}</strong>
-            <div className="request-detail-meta">
-              <span>{searchRequestDetail.matchedProfileCount} cards</span>
-              <span>{detailFields.join(", ")}</span>
-              <span>{formatIpAmount(searchRequestDetail.totalCents)}</span>
-              <span>{searchRequestDetail.id}</span>
-            </div>
-          </section>
+          <div className="request-detail-layout">
+            <div className="request-detail-main">
+              <section className="request-detail-card" aria-label="Request detail">
+                <strong>{searchRequestDetail.prompt}</strong>
+                <div className="request-detail-meta">
+                  <span>{searchRequestDetail.matchedProfileCount} cards</span>
+                  <span>{detailFields.join(", ")}</span>
+                  <span>{formatIpAmount(searchRequestDetail.totalCents)}</span>
+                  <span>{searchRequestDetail.extensions?.length ?? 0} extensions</span>
+                  <span>{searchRequestDetail.id}</span>
+                </div>
+              </section>
 
-          <section className="history-section" aria-label="Previous search results">
-            <h2>Previous search results</h2>
-            {searchRequestDetail.matches.length ? (
-              <div className="request-result-list">
-                {searchRequestDetail.matches.map((match) => (
-                  <article className="request-result-row" key={match.matchRef}>
-                    <div>
-                      <strong>{match.matchRef}</strong>
-                      <small>{match.signals.length ? match.signals.join(" · ") : "Anonymous card"}</small>
-                      <div className="request-field-slots">
-                        {match.fieldCosts.map((fieldCost) => (
-                          <span className="request-field-slot" key={fieldCost.fieldId}>
-                            {fieldCost.label} {formatIpAmount(fieldCost.priceCents)}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                    <strong className="request-result-total">{formatIpAmount(calculateRequestMatchSubtotal(match))}</strong>
-                  </article>
-                ))}
-              </div>
-            ) : (
-              <EmptyState icon={<Search size={24} />} title="No saved search results" />
-            )}
-          </section>
+              <form
+                className="request-extend-form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void handleExtendSearchRequest();
+                }}
+              >
+                <div>
+                  <strong>Find more</strong>
+                  <small>Append new matching cards to this request.</small>
+                </div>
+                <input
+                  value={detailMorePrompt}
+                  onChange={(event) => setDetailMorePrompt(event.target.value)}
+                  placeholder="Add another search prompt"
+                />
+                <button type="submit" disabled={extendBusy || !appAuthReady}>
+                  {extendBusy ? <span className="button-spinner" aria-hidden="true" /> : <Search size={16} />}
+                  {extendBusy ? "Finding" : "Find more"}
+                </button>
+              </form>
+
+              <section className="history-section" aria-label="Search results">
+                <div className="request-section-head">
+                  <h2>Search results</h2>
+                  <button
+                    type="button"
+                    disabled={!detailFieldCosts.length}
+                    onClick={() => setDetailSelectedFieldIds(detailAllFieldsSelected ? [] : detailFieldIds)}
+                  >
+                    {detailAllFieldsSelected ? "Clear" : "All"}
+                  </button>
+                </div>
+                {searchRequestDetail.matches.length ? (
+                  <div className="request-result-list">
+                    {searchRequestDetail.matches.map((match) => {
+                      const matchFieldIds = match.fieldCosts.map((fieldCost) => fieldCost.fieldId);
+                      const matchAllSelected = matchFieldIds.length > 0 && matchFieldIds.every((fieldId) => detailSelectedFieldSet.has(fieldId));
+                      const matchSelectedCount = matchFieldIds.filter((fieldId) => detailSelectedFieldSet.has(fieldId)).length;
+                      return (
+                        <article className="request-result-row" key={match.matchRef}>
+                          <div className="request-result-head">
+                            <label className="request-match-toggle">
+                              <input
+                                aria-label={`Select ${match.matchRef}`}
+                                checked={matchAllSelected}
+                                disabled={!match.fieldCosts.length}
+                                type="checkbox"
+                                onChange={() => toggleDetailMatch(match)}
+                              />
+                              <span>
+                                <strong>{match.matchRef}</strong>
+                                <small>{match.signals.length ? match.signals.join(" · ") : "Anonymous card"}</small>
+                              </span>
+                            </label>
+                            <span className="request-result-count">
+                              {matchSelectedCount}/{matchFieldIds.length}
+                            </span>
+                            <strong className="request-result-total">{formatIpAmount(calculateRequestMatchSubtotal(match))}</strong>
+                          </div>
+                          {match.fieldCosts.length ? (
+                            <div className="request-field-options">
+                              {match.fieldCosts.map((fieldCost) => {
+                                const fieldSelected = detailSelectedFieldSet.has(fieldCost.fieldId);
+                                return (
+                                  <label className={fieldSelected ? "request-field-option selected" : "request-field-option"} key={fieldCost.fieldId}>
+                                    <input
+                                      aria-label={`Select ${fieldCost.label}`}
+                                      checked={fieldSelected}
+                                      type="checkbox"
+                                      onChange={() => toggleDetailField(fieldCost.fieldId)}
+                                    />
+                                    <span className="checkout-field-slot">LV1</span>
+                                    <span className="request-field-name">{fieldCost.label}</span>
+                                    <strong>{formatIpAmount(fieldCost.priceCents)}</strong>
+                                  </label>
+                                );
+                              })}
+                            </div>
+                          ) : (
+                            <small className="request-result-empty">No requested CDR fields</small>
+                          )}
+                        </article>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <EmptyState icon={<Search size={24} />} title="No saved search results" />
+                )}
+              </section>
+            </div>
+
+            <aside className="request-checkout-card" aria-label="Request checkout">
+              <strong>Checkout</strong>
+              <small>Only selected request fields will be minted and ordered.</small>
+              <dl>
+                <div>
+                  <dt>Fields</dt>
+                  <dd>{detailSelectedFieldCosts.length}</dd>
+                </div>
+                <div>
+                  <dt>Cards</dt>
+                  <dd>{detailSelectedCards}</dd>
+                </div>
+                <div>
+                  <dt>Total</dt>
+                  <dd>{formatIpAmount(detailSelectedTotal)}</dd>
+                </div>
+              </dl>
+              <button type="button" onClick={handleCheckoutSearchRequestDetail} disabled={!detailSelectedFieldCosts.length || !appAuthReady || checkoutBusy}>
+                {checkoutBusy ? <span className="button-spinner" aria-hidden="true" /> : <IconAsset name="ip" size={18} />}
+                {checkoutBusy ? "Checking out" : "Checkout"}
+              </button>
+              <p>{searchRequestDetail.prePurchaseNotice}</p>
+            </aside>
+          </div>
         </div>
       );
     }
@@ -2747,8 +2994,10 @@ function CdrAction(props: { field: FieldDraft; busy: boolean; disabled?: boolean
 function EmptyState(props: { icon: ReactNode; title: string }) {
   return (
     <div className="empty-state">
-      {props.icon}
-      <strong>{props.title}</strong>
+      <div className="empty-state-content">
+        {props.icon}
+        <strong>{props.title}</strong>
+      </div>
     </div>
   );
 }

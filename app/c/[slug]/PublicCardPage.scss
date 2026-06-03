@@ -19,16 +19,32 @@
 
 .public-card {
   align-self: center;
-  background: #292929;
+  background: linear-gradient(145deg, #252527 0%, #2c2b2a 46%, #202324 100%);
   border-radius: 8px;
   box-shadow: var(--shadow);
   color: #fff;
+  isolation: isolate;
   margin: 0 auto;
   min-height: min(620px, calc(100vh - 190px));
   overflow: hidden;
   padding: 22px;
   position: relative;
   width: min(520px, calc(100vw - 44px));
+}
+
+.public-card::before {
+  animation: card-gradient-drift 10s ease-in-out infinite alternate;
+  background:
+    radial-gradient(circle at 18% 18%, rgba(188, 161, 141, 0.58), transparent 28%),
+    radial-gradient(circle at 82% 24%, rgba(102, 145, 151, 0.28), transparent 30%),
+    radial-gradient(circle at 50% 78%, rgba(255, 255, 255, 0.11), transparent 34%),
+    linear-gradient(125deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0) 44%, rgba(188, 161, 141, 0.14));
+  content: "";
+  inset: -35%;
+  opacity: 0.72;
+  position: absolute;
+  transform: translate3d(-2%, -1%, 0) rotate(0deg) scale(1);
+  z-index: 0;
 }
 
 .public-card-head {
@@ -107,6 +123,7 @@
   top: 50%;
   transform: translate(-50%, -50%);
   width: calc(100% - 88px);
+  z-index: 1;
 }
 
 .public-card-watermark-mark {
@@ -159,6 +176,26 @@
   font-weight: 400;
   justify-self: center;
   text-decoration: none;
+}
+
+@keyframes card-gradient-drift {
+  0% {
+    transform: translate3d(-3%, -2%, 0) rotate(0deg) scale(1);
+  }
+
+  50% {
+    transform: translate3d(3%, 2%, 0) rotate(7deg) scale(1.05);
+  }
+
+  100% {
+    transform: translate3d(1%, -3%, 0) rotate(-5deg) scale(1.04);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .public-card::before {
+    animation: none;
+  }
 }
 
 @media (max-width: 560px) {

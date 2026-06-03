@@ -154,6 +154,11 @@ async function deployCdrVault({ publicClient, walletClient, owner, label, value,
     cdrVaultUuid: String(uuid),
     allocateTxHash,
     deployTxHash: writeTxHash,
+    cdrOwnerAddress: owner,
+    writeConditionAddress: writeCondition.address,
+    readConditionAddress: readCondition.address,
+    writeConditionData: writeCondition.conditionData,
+    readConditionData: readCondition.conditionData,
   };
 }
 
@@ -247,6 +252,11 @@ async function main() {
       cdrVaultUuid: cdr.cdrVaultUuid,
       deployTxHash: cdr.deployTxHash,
       allocateTxHash: cdr.allocateTxHash,
+      cdrOwnerAddress: cdr.cdrOwnerAddress,
+      writeConditionAddress: cdr.writeConditionAddress,
+      readConditionAddress: cdr.readConditionAddress,
+      writeConditionData: cdr.writeConditionData,
+      readConditionData: cdr.readConditionData,
       cdrLicenseIpId: registered.ipId,
       cdrLicenseTermsId: parentLicenseTermsId.toString(),
       ipaNftContract: spgNftContract,

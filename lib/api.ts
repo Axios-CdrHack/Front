@@ -54,12 +54,20 @@ export function getSearchRequest(requestId: string) {
   return apiRequest<{ request: SearchRequestDetail }>(`/search/requests/${encodeURIComponent(requestId)}`);
 }
 
+export function extendSearchRequest(requestId: string, input: { prompt: string }) {
+  return apiRequest<{ request: SearchRequestDetail }>(`/search/requests/${encodeURIComponent(requestId)}/extend`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
 export function createOrder(input: {
   quoteId?: string;
   buyerWallet: string;
   prompt: string;
   wantedFields: DataFieldKind[];
   selectedMatchRefs?: string[];
+  selectedFieldIds?: string[];
   licenseTokenGrants?: LicenseTokenGrant[];
   paymentTxHash?: string;
 }) {
