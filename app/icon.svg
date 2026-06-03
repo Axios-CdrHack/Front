@@ -1,0 +1,9 @@
+<svg width="64" height="64" viewBox="0 0 25 25" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .favicon-mark { fill: #111315; }
+    @media (prefers-color-scheme: dark) {
+      .favicon-mark { fill: #ffffff; }
+    }
+  </style>
+  <path class="favicon-mark" d="M16.1475 17.583L24.0418 24.0419L12.2004 12.0211L24.0418 0.000307343L16.0578 6.54896C13.7254 8.46272 10.3764 8.46272 7.98416 6.54896L0.000180939 0.000307343L11.4229 12.0211L0.000180939 24.0419L7.89445 17.583C10.2866 15.6094 13.7553 15.6094 16.1475 17.583Z"/>
+</svg>

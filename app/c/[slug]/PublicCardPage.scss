@@ -1,0 +1,177 @@
+.public-card-page {
+  align-items: center;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  min-height: 100vh;
+  padding: 28px 18px 58px;
+}
+
+.public-card-brand {
+  align-items: center;
+  color: var(--accent);
+  display: inline-flex;
+  font-size: 1.42rem;
+  font-weight: 500;
+  gap: 0.42rem;
+  justify-self: center;
+  line-height: 1;
+}
+
+.public-card {
+  align-self: center;
+  background: #292929;
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  color: #fff;
+  margin: 0 auto;
+  min-height: min(620px, calc(100vh - 190px));
+  overflow: hidden;
+  padding: 22px;
+  position: relative;
+  width: min(520px, calc(100vw - 44px));
+}
+
+.public-card-head {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  left: 22px;
+  min-width: 0;
+  position: absolute;
+  right: 22px;
+  top: 22px;
+  z-index: 1;
+}
+
+.public-card-profile {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  min-width: 0;
+}
+
+.public-avatar {
+  align-items: center;
+  background: #bca18d;
+  border-radius: 4px;
+  color: #fff;
+  display: inline-flex;
+  flex: 0 0 auto;
+  font-size: 1rem;
+  font-weight: 800;
+  height: 40px;
+  justify-content: center;
+  overflow: hidden;
+  text-transform: uppercase;
+  width: 40px;
+}
+
+.public-card h1 {
+  align-items: center;
+  display: flex;
+  font-size: 1rem;
+  font-weight: 800;
+  gap: 4px;
+  line-height: 1;
+  margin: 0;
+  min-width: 0;
+}
+
+.public-card p {
+  color: rgba(255, 255, 255, 0.58);
+  margin: 0;
+}
+
+.public-card-id {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.public-card-id p {
+  font-size: 0.82rem;
+  line-height: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.public-card-watermark {
+  align-items: center;
+  display: grid;
+  justify-content: center;
+  left: 50%;
+  max-width: 300px;
+  pointer-events: none;
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: calc(100% - 88px);
+}
+
+.public-card-watermark-mark {
+  filter: invert(1);
+  opacity: 0.12;
+}
+
+.public-card-details {
+  bottom: 22px;
+  display: grid;
+  gap: 10px;
+  left: 22px;
+  min-width: 0;
+  position: absolute;
+  right: 22px;
+  z-index: 1;
+}
+
+.public-card-detail {
+  align-items: center;
+  color: rgba(255, 255, 255, 0.76);
+  display: grid;
+  font-size: 0.84rem;
+  gap: 8px;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  min-width: 0;
+}
+
+.public-card-detail strong {
+  color: inherit;
+  font-size: inherit;
+  font-weight: 800;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.public-card-detail p {
+  color: inherit;
+  font-size: inherit;
+  line-height: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.public-card-cancel {
+  color: var(--muted);
+  display: inline-flex;
+  font-size: 1.08rem;
+  font-weight: 400;
+  justify-self: center;
+  text-decoration: none;
+}
+
+@media (max-width: 560px) {
+.public-card-page {
+    padding: 26px 18px 44px;
+  }
+
+  .public-card-brand {
+    font-size: 1.24rem;
+  }
+
+  .public-card {
+    padding: 20px 20px 24px;
+    width: min(100%, 360px);
+  }
+}

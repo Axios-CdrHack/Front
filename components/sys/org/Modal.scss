@@ -1,0 +1,275 @@
+.button-spinner {
+  animation: button-spin 0.6s linear infinite;
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  border-radius: 50%;
+  border-top-color: #fff;
+  height: 14px;
+  width: 14px;
+}
+
+@keyframes button-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.profile-input {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.profile-input span {
+  color: #101214;
+  font-weight: 500;
+}
+
+.profile-input input {
+  background: var(--soft);
+  border: 0;
+  border-radius: 8px;
+  color: #101214;
+  min-height: 58px;
+  outline: none;
+  padding: 0 18px;
+  width: 100%;
+}
+
+.profile-input input:disabled {
+  cursor: not-allowed;
+  opacity: 1;
+}
+
+.modal-backdrop {
+  align-items: center;
+  background: rgba(17, 19, 21, 0.42);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  padding: 20px;
+  position: fixed;
+  z-index: 20;
+}
+
+.confirm-modal,
+.user-modal,
+.cdr-deploy-modal {
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  max-width: 420px;
+  padding: 22px;
+  width: min(100%, 420px);
+}
+
+.confirm-modal h2,
+.user-modal h2,
+.cdr-deploy-modal h2 {
+  font-size: 1.35rem;
+  line-height: 1.1;
+  margin: 0;
+}
+
+.confirm-modal-body {
+  color: var(--muted);
+  line-height: 1.55;
+  margin: 14px 0 0;
+}
+
+.modal-status {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+  margin: 14px 0 0;
+  text-align: center;
+}
+
+.confirm-modal-actions {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 1fr 1fr;
+  margin-top: 20px;
+}
+
+.modal-primary,
+.modal-secondary,
+.modal-danger {
+  align-items: center;
+  border: 0;
+  border-radius: 8px;
+  display: inline-flex;
+  font-weight: 800;
+  justify-content: center;
+  min-height: 46px;
+  padding: 0 14px;
+}
+
+.modal-primary {
+  background: var(--accent);
+  color: #fff;
+}
+
+.modal-primary.loading {
+  gap: 0;
+}
+
+.modal-secondary {
+  background: #eeeeef;
+  color: var(--ink);
+}
+
+.modal-danger {
+  background: var(--danger);
+  color: #fff;
+}
+
+.wide {
+  width: 100%;
+}
+
+.modal-title-line {
+  align-items: flex-start;
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 18px;
+}
+
+.modal-title-line h2 {
+  margin: 0;
+}
+
+.modal-title-line small {
+  color: var(--accent);
+  font-size: 0.72rem;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.modal-title-line button {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  font-size: 1.5rem;
+  line-height: 1;
+  padding: 0;
+}
+
+.modal-title-line button:disabled {
+  cursor: not-allowed;
+  opacity: 0.35;
+}
+
+.user-modal {
+  display: grid;
+  gap: 12px;
+}
+
+.readonly-field input {
+  color: #111315;
+}
+
+.modal-caution {
+  background: #f3f3f4;
+  border-radius: 8px;
+  display: grid;
+  gap: 4px;
+  padding: 12px 14px;
+}
+
+.modal-caution strong {
+  color: var(--ink);
+  font-size: 0.76rem;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.modal-caution p {
+  color: var(--muted);
+  font-size: 0.88rem;
+  line-height: 1.4;
+  margin: 0;
+}
+
+.cdr-deploy-modal {
+  display: grid;
+  gap: 14px;
+}
+
+.cdr-deploy-modal .profile-input {
+  margin-bottom: 0;
+}
+
+.cdr-deploy-summary {
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 0.78rem;
+  gap: 8px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.cdr-deploy-summary span {
+  background: #f3f3f4;
+  border-radius: 999px;
+  padding: 6px 9px;
+}
+
+.cdr-deploy-status {
+  align-items: center;
+  color: var(--muted);
+  display: inline-flex;
+  font-size: 0.82rem;
+  font-weight: 700;
+  gap: 8px;
+  line-height: 1.35;
+  margin: 0;
+}
+
+.cdr-deploy-status::before {
+  animation: button-spin 0.6s linear infinite;
+  border: 2px solid rgba(17, 19, 21, 0.18);
+  border-radius: 50%;
+  border-top-color: var(--accent);
+  content: "";
+  height: 12px;
+  width: 12px;
+}
+
+.wallet-connect-box {
+  display: grid;
+  gap: 10px;
+}
+
+.wallet-connect-box.stacked {
+  gap: 12px;
+}
+
+.wallet-inline-field {
+  display: grid;
+  gap: 8px;
+}
+
+.wallet-inline-row {
+  align-items: stretch;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.wallet-inline-row input {
+  min-width: 0;
+}
+
+.wallet-inline-button {
+  align-self: end;
+}
+
+.wallet-inline-button [data-rk] {
+  display: flex;
+}
+
+.wallet-inline-button button {
+  min-height: 64px;
+  white-space: nowrap;
+}
