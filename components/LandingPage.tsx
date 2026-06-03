@@ -109,6 +109,14 @@ export function LandingPage() {
           </div>
         </div>
       </section>
+
+      <footer className="landing-footer">
+        <span>AXIOS hackathon MVP</span>
+        <nav aria-label="Legal links">
+          <a href="/terms">Terms</a>
+          <a href="/privacy">Privacy</a>
+        </nav>
+      </footer>
     </main>
   );
 }
